@@ -21,6 +21,7 @@
 		5229C8C3201B440745517CFB /* Settings.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE7EB1C8E2A398E1D57F67D2 /* Settings.swift */; };
 		85D3D904B3E4CF11EF0A3042 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F02F5F5C6A33AB2D897E3A9F /* SettingsView.swift */; };
 		C13D9960A709521B9A68A1BF /* Support.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D8F1C62D18DC5F940075FC8 /* Support.swift */; };
+		04E8DB7681FD3B6912027F47 /* Suggestions.swift in Sources */ = {isa = PBXBuildFile; fileRef = B41F3CD7485B5C5FB0D1BBFD /* Suggestions.swift */; };
 		D2B2CE25B487C834A0044F51 /* TreeOutline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6960D47E51ACCBE33A0D9BDD /* TreeOutline.swift */; };
 		4BB0AA373810A82FF89CEB68 /* TreemapView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1954F2C7ABF4CFA3CBB8C567 /* TreemapView.swift */; };
 		A1D3E5F7092B4C6D8E0F1A2B /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2E4F6081A3C5D7E9F0A1B2C /* Theme.swift */; };
@@ -43,6 +44,7 @@
 		BE7EB1C8E2A398E1D57F67D2 /* Settings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Settings.swift; sourceTree = "<group>"; };
 		F02F5F5C6A33AB2D897E3A9F /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		0D8F1C62D18DC5F940075FC8 /* Support.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Support.swift; sourceTree = "<group>"; };
+		B41F3CD7485B5C5FB0D1BBFD /* Suggestions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Suggestions.swift; sourceTree = "<group>"; };
 		6960D47E51ACCBE33A0D9BDD /* TreeOutline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TreeOutline.swift; sourceTree = "<group>"; };
 		1954F2C7ABF4CFA3CBB8C567 /* TreemapView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TreemapView.swift; sourceTree = "<group>"; };
 		B2E4F6081A3C5D7E9F0A1B2C /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
@@ -93,6 +95,7 @@
 				BE7EB1C8E2A398E1D57F67D2 /* Settings.swift */,
 				F02F5F5C6A33AB2D897E3A9F /* SettingsView.swift */,
 				0D8F1C62D18DC5F940075FC8 /* Support.swift */,
+				B41F3CD7485B5C5FB0D1BBFD /* Suggestions.swift */,
 				6960D47E51ACCBE33A0D9BDD /* TreeOutline.swift */,
 				1954F2C7ABF4CFA3CBB8C567 /* TreemapView.swift */,
 				B2E4F6081A3C5D7E9F0A1B2C /* Theme.swift */,
@@ -184,6 +187,7 @@
 				5229C8C3201B440745517CFB /* Settings.swift in Sources */,
 				85D3D904B3E4CF11EF0A3042 /* SettingsView.swift in Sources */,
 				C13D9960A709521B9A68A1BF /* Support.swift in Sources */,
+				04E8DB7681FD3B6912027F47 /* Suggestions.swift in Sources */,
 				D2B2CE25B487C834A0044F51 /* TreeOutline.swift in Sources */,
 				4BB0AA373810A82FF89CEB68 /* TreemapView.swift in Sources */,
 				A1D3E5F7092B4C6D8E0F1A2B /* Theme.swift in Sources */,
