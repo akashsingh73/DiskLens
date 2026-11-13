@@ -8,8 +8,8 @@ and how old your data is.
 
 - **Free and open source** under the MIT license. No account, no ads, no telemetry.
 - **Private**: DiskLens never connects to the internet. Everything stays on your Mac.
-- **Fast and native**: built with SwiftUI and AppKit, it reads about half a million files in under two seconds on
-  every core at once, and shows the folder tree within a moment, filling it in as the scan goes.
+- **Fast and native**: built with SwiftUI and AppKit, it reads about half a million files in about a second,
+  several folders at once, and shows the folder tree within a moment, filling it in as the scan goes.
 - **Easy to build**: one command with Apple's free Command Line Tools. No Xcode, no Apple developer account,
   no Gatekeeper warnings.
 
@@ -189,8 +189,10 @@ A few rules keep DiskLens stable; please keep to them:
 - **Threads**: the scan runs on background threads; everything on screen is updated on the main thread only.
   Once the tree is on screen it belongs to the main thread: scan workers read folders into trees of their own
   ("pieces", see `ScanEngine.stream`) and the main thread fills them in with `ScanResult.fillIn`.
-- **Speed**: one worker per core shares a queue of folders; a busy worker hands subfolders to idle ones
-  (`WorkQueue`), so lopsided folders don't leave cores idle. Measure before and after any change to the scanner.
+- **Speed**: a few workers share a queue of folders; a busy worker hands subfolders to idle ones (`WorkQueue`),
+  so lopsided folders don't leave workers idle. There are at most six (`ScanEngine.readers`): reading folders is
+  almost all work inside macOS's file system, where more threads only wait on each other. Sorting table rows goes
+  through `FastSort`, not `sorted(using:)`. Measure before and after any change to the scanner.
 - **Never wait on the cloud during a scan**: scan threads run with cloud fetching turned off (`CloudFiles`).
 - **Big folders stay responsive**: Details lists at most the 50,000 largest files of a folder, "Expand All
   Below" stops after a few thousand folders, and search keeps only the 500 largest matches and reads folders on

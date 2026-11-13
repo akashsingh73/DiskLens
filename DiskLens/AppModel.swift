@@ -18,6 +18,20 @@ final class ScanStatus: ObservableObject {
     }
 }
 
+/// How far reading the folders only in the cloud has got, after a scan. Kept apart from AppModel,
+/// like ScanStatus, so its twice-a-second updates redraw only the strip that shows them.
+/// Main thread only.
+final class CloudReadStatus: ObservableObject {
+    struct Progress: Equatable {
+        var total = 0
+        var done = 0
+        /// The folders being read right now, longest-running first.
+        var reading: [String] = []
+    }
+
+    @Published fileprivate(set) var progress = Progress()
+}
+
 /// App state: the current scan, where the user is, navigation history, and scan control.
 /// Everything here runs on the main thread; the scan itself runs on background threads.
 @MainActor
@@ -58,17 +72,20 @@ final class AppModel: ObservableObject {
     /// A file Details should select once it lists the folder being shown (a search result).
     @Published private(set) var fileToHighlight: String?
 
-    /// Reading folders that were only in the cloud, after a scan: how far it got. nil otherwise.
-    struct CloudStatus: Equatable {
-        var total: Int
-        var done: Int
-        var reading: [String]
-    }
-    @Published private(set) var cloudStatus: CloudStatus?
+    /// Folders that were only in the cloud are being read, after a scan (how far: `cloud`).
+    @Published private(set) var isReadingCloud = false
+    let cloud = CloudReadStatus()
+
+    /// Size and free space of the scanned disk, and of the startup disk (for the welcome screen).
+    /// Each lookup takes several milliseconds, so they are made in the background when something
+    /// changes the disk (a scan, a move to the Trash) rather than whenever the window redraws.
+    @Published private(set) var volume: VolumeInfo?
+    @Published private(set) var startupVolume: VolumeInfo?
+    private var volumeTask: Task<Void, Never>?
 
     /// While the tree is still changing (a scan, or cloud folders being read after it), things
     /// that rely on it staying put, like Move to Trash and search, wait.
-    var isReadingTree: Bool { isScanning || cloudStatus != nil }
+    var isReadingTree: Bool { isScanning || isReadingCloud }
     /// The scan on screen is the one still being read (its tree is filling in).
     var isShowingLiveScan: Bool { isScanning && result != nil && result === liveScan }
 
@@ -77,6 +94,7 @@ final class AppModel: ObservableObject {
 
     init() {
         search.app = self
+        refreshVolumes()
     }
 
     private var activeProgress: ScanProgress?
@@ -246,6 +264,8 @@ final class AppModel: ObservableObject {
         let previous = result
         result = newResult
         if let previous { DispatchQueue.global(qos: .utility).async { _ = previous } }
+        if previous?.rootPath != newResult.rootPath { volume = nil }
+        refreshVolumes()
         search.scanChanged()
         backStack.removeAll()
         forwardStack.removeAll()
@@ -278,6 +298,7 @@ final class AppModel: ObservableObject {
         HistoryStore.append(historyEntry(for: scan))
         history = HistoryStore.entries(for: scan.rootPath)
         recentScans = HistoryStore.recent()
+        refreshVolumes()
 
         if Prefs.cloudFolderMode == .read && !scan.cloudFolders.isEmpty {
             readCloudFolders()       // records the snapshot when it's done
@@ -302,7 +323,8 @@ final class AppModel: ObservableObject {
         let progress = ScanProgress()
         let inbox = ScanInbox()
         cloudProgress = progress
-        cloudStatus = CloudStatus(total: folders.count, done: 0, reading: [])
+        cloud.progress = CloudReadStatus.Progress(total: folders.count)
+        isReadingCloud = true
         cloudActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiated,
                                                                reason: "Reading folders from the cloud")
         Log.scan.info("Reading \(folders.count) folders from the cloud")
@@ -317,8 +339,9 @@ final class AppModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 guard let self, self.cloudProgress === progress else { return }
                 let snapshot = progress.read()
-                self.cloudStatus = CloudStatus(total: max(snapshot.branchesTotal, folders.count),
-                                               done: snapshot.branchesDone, reading: snapshot.reading)
+                let next = CloudReadStatus.Progress(total: max(snapshot.branchesTotal, folders.count),
+                                                    done: snapshot.branchesDone, reading: snapshot.reading)
+                if self.cloud.progress != next { self.cloud.progress = next }
                 self.fillIn(from: inbox, into: scan, redrawEvery: 1)
             }
         }
@@ -347,7 +370,7 @@ final class AppModel: ObservableObject {
             cloudActivity = nil
         }
         fillIn(from: inbox, into: scan, redrawEvery: 0)
-        cloudStatus = nil
+        isReadingCloud = false
         scan.cloudFolders = scan.cloudFolders.filter { $0.node.cloudOnly }
         Log.scan.info("Cloud folders read; \(scan.cloudFolders.count) left unread")
         guard result === scan else { return }
@@ -355,6 +378,7 @@ final class AppModel: ObservableObject {
         HistoryStore.update(historyEntry(for: scan))
         history = HistoryStore.entries(for: scan.rootPath)
         recentScans = HistoryStore.recent()
+        refreshVolumes()
         recordSnapshot(of: scan)
     }
 
@@ -513,7 +537,7 @@ final class AppModel: ObservableObject {
     /// Moving things to the Trash waits until the tree stops changing.
     private func explainWaitForScan() {
         errorTitle = "Wait for the scan to finish"
-        errorText = cloudStatus != nil
+        errorText = isReadingCloud
             ? "DiskLens is still reading folders from the cloud. Moving things to the Trash works once it's done, or stop reading them in the summary above the folder tree."
             : "DiskLens is still reading folders. Moving things to the Trash works once the scan is done."
         showingError = true
@@ -561,6 +585,7 @@ final class AppModel: ObservableObject {
             scan.remove(tally)
             scan.hardLinkDuplicates = max(0, scan.hardLinkDuplicates - node.uncountedLinksBelow)
             refreshChanges()
+            refreshVolumes()
             version += 1
         }
     }
@@ -600,23 +625,33 @@ final class AppModel: ObservableObject {
         }
         result?.topFiles.removeAll { $0.path == path }
         refreshChanges()
+        refreshVolumes()
         version += 1
     }
 
     // MARK: - Volume
 
-    struct VolumeInfo {
+    struct VolumeInfo: Equatable, Sendable {
         let total: Int64
         let available: Int64
     }
 
-    var volumeInfo: VolumeInfo? {
-        guard let path = result?.rootPath else { return nil }
-        return Self.volumeInfo(at: path)
+    /// Looks up `volume` and `startupVolume` again, in the background.
+    func refreshVolumes() {
+        let path = result?.rootPath
+        volumeTask?.cancel()
+        volumeTask = Task { @MainActor [weak self] in
+            let (scanned, startup) = await Task.detached(priority: .utility) {
+                (path.flatMap { AppModel.volumeInfo(at: $0) }, AppModel.volumeInfo(at: "/"))
+            }.value
+            guard let self, !Task.isCancelled, self.result?.rootPath == path else { return }
+            if self.volume != scanned { self.volume = scanned }
+            if self.startupVolume != startup { self.startupVolume = startup }
+        }
     }
 
-    /// Size and free space of the disk that holds `path`.
-    static func volumeInfo(at path: String) -> VolumeInfo? {
+    /// Size and free space of the disk that holds `path`. Takes several milliseconds.
+    nonisolated static func volumeInfo(at path: String) -> VolumeInfo? {
         let keys: Set<URLResourceKey> = [.volumeTotalCapacityKey, .volumeAvailableCapacityForImportantUsageKey]
         guard let values = try? URL(fileURLWithPath: path).resourceValues(forKeys: keys),
               let total = values.volumeTotalCapacity else { return nil }

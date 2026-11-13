@@ -448,27 +448,32 @@ final class FileSearch: @unchecked Sendable {
         let folders = index.fileFolders.sorted { $0.ownAllocated > $1.ownAllocated }
         let chunkSize = 64
         let chunks = (folders.count + chunkSize - 1) / chunkSize
-        DispatchQueue.concurrentPerform(iterations: chunks) { chunk in
-            var local = LargestHits(capacity: limit, bySize: bySize)
-            var read = 0
-            for entry in folders[(chunk * chunkSize)..<min(folders.count, (chunk + 1) * chunkSize)] {
-                if isCancelled { return }
-                let path = index.path(of: entry.folder)
-                FolderReader.files(in: path, matching: query, uncounted: entry.uncounted) { name, facts, counted in
-                    let allocated = counted ? facts.allocated : 0
-                    guard local.wants(bySize ? facts.size : allocated) else {
-                        local.count()
-                        return
+        let readers = ScanEngine.readers
+        // As many threads as a scan uses (see `ScanEngine.readers`), each taking every n-th chunk,
+        // so the biggest folders are still read first. Matches show up chunk by chunk.
+        DispatchQueue.concurrentPerform(iterations: readers) { reader in
+            for chunk in stride(from: reader, to: chunks, by: readers) {
+                var local = LargestHits(capacity: limit, bySize: bySize)
+                var read = 0
+                for entry in folders[(chunk * chunkSize)..<min(folders.count, (chunk + 1) * chunkSize)] {
+                    if isCancelled { return }
+                    let path = index.path(of: entry.folder)
+                    FolderReader.files(in: path, matching: query, uncounted: entry.uncounted) { name, facts, counted in
+                        let allocated = counted ? facts.allocated : 0
+                        guard local.wants(bySize ? facts.size : allocated) else {
+                            local.count()
+                            return
+                        }
+                        local.add(SearchHit(kind: .file, name: name, folder: entry.folder, size: facts.size,
+                                            allocated: allocated, path: SearchIndex.join(path, [name]), counted: counted))
                     }
-                    local.add(SearchHit(kind: .file, name: name, folder: entry.folder, size: facts.size,
-                                        allocated: allocated, path: SearchIndex.join(path, [name]), counted: counted))
+                    read += 1
                 }
-                read += 1
+                lock.lock()
+                found.merge(local)
+                foldersRead += read
+                lock.unlock()
             }
-            lock.lock()
-            found.merge(local)
-            foldersRead += read
-            lock.unlock()
         }
         markFinished()
     }

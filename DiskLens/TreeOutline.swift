@@ -397,7 +397,7 @@ final class TreeCellView: NSTableCellView {
         case node.unreadable: icon.image = Self.lockIcon
         case node.otherVolume: icon.image = Self.driveIcon
         case node.cloudOnly: icon.image = Self.cloudIcon
-        case node.name.hasSuffix(".app"): icon.image = NSWorkspace.shared.icon(forFile: node.path)
+        case node.name.hasSuffix(".app"): icon.image = IconCache.icon(name: node.name, path: node.path, isFolder: true)
         default: icon.image = Self.folderIcon
         }
 

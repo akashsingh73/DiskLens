@@ -144,6 +144,31 @@ struct DiskLensTests {
         c.equal(SizeFormat.count(2, "extra hard link"), "2 extra hard links", "two")
         c.equal(SizeFormat.count(0, "folder"), "0 folders", "zero")
 
+        c.section("Sorting table rows")
+        func row(_ name: String, _ allocated: Int64, _ size: Int64, _ day: Double) -> DetailItem {
+            DetailItem(id: "/f/" + name, name: name, isFolder: false, size: size, allocated: allocated, files: 1,
+                       folders: 0, modified: Date(timeIntervalSince1970: day * 86_400), kind: "Document",
+                       percent: Double(allocated) / 100, unreadable: false)
+        }
+        // Many equal sizes (ties keep their order), names that sort by number ("File 2" before "File 10").
+        let rows = (0..<200).map { i in row("File \((i * 37) % 200)", Int64(i % 7), Int64(i % 5), Double(i % 3)) }
+        let orders: [[KeyPathComparator<DetailItem>]] = [
+            [KeyPathComparator(\.allocated, order: .reverse)],
+            [KeyPathComparator(\.allocated)],
+            [KeyPathComparator(\.name)],
+            [KeyPathComparator(\.name, order: .reverse)],
+            [KeyPathComparator(\.percent, order: .reverse)],
+            [KeyPathComparator(\.modified)],
+            [KeyPathComparator(\.size, order: .reverse), KeyPathComparator(\.name)],
+            [KeyPathComparator(\.modified, order: .reverse), KeyPathComparator(\.allocated), KeyPathComparator(\.name)],
+        ]
+        for (index, order) in orders.enumerated() {
+            c.equal(FastSort.sorted(rows, using: order).map(\.id), rows.sorted(using: order).map(\.id), "order \(index + 1)")
+        }
+        c.equal(FastSort.sorted(rows, using: []).map(\.id), rows.map(\.id), "no sort order keeps the rows as they are")
+        c.equal(FastSort.sorted(rows, using: [KeyPathComparator(\.name)]).prefix(3).map(\.name),
+                ["File 0", "File 1", "File 2"], "names sort like Finder")
+
         c.section("Age bands")
         let day: Int64 = 86_400
         c.equal(AgeBands.index(ageSeconds: 0), 0, "brand new")

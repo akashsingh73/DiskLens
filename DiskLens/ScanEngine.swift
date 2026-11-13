@@ -51,18 +51,26 @@ enum ScanEngine {
                                  topCount: Int, now: Int64, progress: ScanProgress,
                                  deliver: @escaping @Sendable (ScanPiece) -> Void) {
         progress.startReading(branches: folders.count)
-        runWorkers(WorkQueue(folders), rootDevice: rootDevice, links: links, topCount: topCount, now: now,
+        // Waiting on the internet rather than the disk: more at once helps here.
+        runWorkers(WorkQueue(folders), workers: max(2, ProcessInfo.processInfo.activeProcessorCount),
+                   rootDevice: rootDevice, links: links, topCount: topCount, now: now,
                    progress: progress, fetchCloud: true, deliver: deliver)
         progress.startFinishing()
     }
 
-    /// Reads the queue's folders with one worker per core until all are read, delivering each
-    /// as a piece. Busy workers hand subfolders to idle ones (see `WorkQueue`), so every core
+    /// How many folders are read at once. Reading a folder is almost all work inside macOS's file
+    /// system, which serializes much of it: past about six readers, extra threads mostly wait on
+    /// each other there. Measured on a 16-core Mac scanning 477,000 files: 16 readers took 1.66 s
+    /// and 17 s of CPU, 6 readers 0.89 s and 3.3 s. This is about the Mac, not the folder: any
+    /// number of files is read, just by these few threads.
+    static var readers: Int { max(2, min(ProcessInfo.processInfo.activeProcessorCount, 6)) }
+
+    /// Reads the queue's folders with `workers` threads until all are read, delivering each
+    /// as a piece. Busy workers hand subfolders to idle ones (see `WorkQueue`), so every worker
     /// stays busy until the end however lopsided the folders are.
-    private static func runWorkers(_ queue: WorkQueue, rootDevice: UInt64, links: HardLinkRegistry,
+    private static func runWorkers(_ queue: WorkQueue, workers: Int, rootDevice: UInt64, links: HardLinkRegistry,
                                    topCount: Int, now: Int64, progress: ScanProgress, fetchCloud: Bool,
                                    deliver: @escaping @Sendable (ScanPiece) -> Void) {
-        let workers = max(2, ProcessInfo.processInfo.activeProcessorCount)
         DispatchQueue.concurrentPerform(iterations: workers) { _ in
             func work() {
                 while let job = queue.next() {
@@ -143,8 +151,8 @@ enum ScanEngine {
         progress.startReading(branches: branches.count)
         showTree(result)
 
-        runWorkers(WorkQueue(branches), rootDevice: rootDevice, links: links, topCount: topCount, now: now,
-                   progress: progress, fetchCloud: false, deliver: deliver)
+        runWorkers(WorkQueue(branches), workers: readers, rootDevice: rootDevice, links: links, topCount: topCount,
+                   now: now, progress: progress, fetchCloud: false, deliver: deliver)
         if progress.isCancelled { return .cancelled }
         progress.startFinishing()
         return .finished(result)

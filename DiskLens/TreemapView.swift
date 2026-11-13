@@ -142,6 +142,10 @@ struct TreemapLayoutKey: Equatable {
 /// The tiles are laid out inside the Canvas, from the size the Canvas is drawn at, and kept in a
 /// cache that never triggers a redraw. Nothing measures the view and writes the size back into
 /// state, so the layout can't feed back into itself.
+///
+/// Drawing every tile and its label takes around 12 ms, so the tiles are drawn by a view of their
+/// own (`TreemapTiles`) that redraws only when they change. The highlight that follows the mouse
+/// is drawn on top by a separate, tiny Canvas.
 struct TreemapView: View {
     @ObservedObject var model: AppModel
     let node: Node
@@ -158,34 +162,42 @@ struct TreemapView: View {
 
     var body: some View {
         let hoveredTile = state.hoveredTile
-        let version = model.version
         VStack(spacing: 0) {
-            Canvas { context, size in
-                let tiles = layout(for: size, version: version)
-                draw(tiles, hovered: state.hoveredTile?.index, in: &context)
-            }
-            .onContinuousHover { phase in
-                switch phase {
-                case .active(let location): state.hover(at: location)
-                case .ended: state.endHover()
-                }
-            }
-            .onTapGesture(count: 2) { location in
-                guard let tile = state.tile(at: location) else { return }
-                let target = tile.node.kind == .files ? (tile.node.parent ?? tile.node) : tile.node
-                model.navigate(to: target)
-            }
-            .contextMenu {
-                if let tile = state.hoveredTile?.tile {
-                    let target = tile.node
-                    if target.kind == .directory && target !== scope {
-                        Button("Show Contents") { model.navigate(to: target) }
-                        Divider()
+            TreemapTiles(state: state, scope: scope, version: model.version, settings: settings,
+                         maxDepth: maxDepth, minTile: minTile, cushion: cushion, coloring: coloring)
+                .equatable()
+                .overlay {
+                    Canvas { context, _ in
+                        guard let rect = hoveredTile?.tile.rect else { return }
+                        let radius: CGFloat = hoveredTile?.tile.depth == 1 ? 5 : 3
+                        let path = Path(roundedRect: rect, cornerRadius: min(radius, rect.width / 3, rect.height / 3))
+                        context.fill(path, with: .color(.white.opacity(0.18)))
+                        context.stroke(path, with: .color(.white), lineWidth: 2)
                     }
-                    Button("Reveal in Finder") { FileActions.reveal(target.path) }
-                    Button("Copy Path") { FileActions.copyPath(target.path) }
+                    .allowsHitTesting(false)
                 }
-            }
+                .onContinuousHover { phase in
+                    switch phase {
+                    case .active(let location): state.hover(at: location)
+                    case .ended: state.endHover()
+                    }
+                }
+                .onTapGesture(count: 2) { location in
+                    guard let tile = state.tile(at: location) else { return }
+                    let target = tile.node.kind == .files ? (tile.node.parent ?? tile.node) : tile.node
+                    model.navigate(to: target)
+                }
+                .contextMenu {
+                    if let tile = state.hoveredTile?.tile {
+                        let target = tile.node
+                        if target.kind == .directory && target !== scope {
+                            Button("Show Contents") { model.navigate(to: target) }
+                            Divider()
+                        }
+                        Button("Reveal in Finder") { FileActions.reveal(target.path) }
+                        Button("Copy Path") { FileActions.copyPath(target.path) }
+                    }
+                }
             Divider()
             footer(hoveredTile?.tile)
         }
@@ -212,11 +224,39 @@ struct TreemapView: View {
         .padding(.horizontal, 10)
         .frame(height: 28)
     }
+}
 
-    private func layout(for size: CGSize, version: Int) -> [TreemapTile] {
+/// The tiles of the treemap and their labels. Equatable on what it draws, so SwiftUI redraws it
+/// only when that changes: not when the mouse moves, nor when something elsewhere in the window does.
+private struct TreemapTiles: View, Equatable {
+    /// Holds the layout cache, which drawing fills in. Not observed: the hover it publishes is
+    /// drawn by `TreemapView`.
+    let state: TreemapState
+    let scope: Node
+    let version: Int
+    let settings: DisplaySettings
+    let maxDepth: Int
+    let minTile: Double
+    let cushion: Bool
+    let coloring: TreemapColoring
+
+    /// `state` is left out: it belongs to the one `TreemapView` this is part of, so it never changes.
+    nonisolated static func == (a: TreemapTiles, b: TreemapTiles) -> Bool {
+        a.scope === b.scope && a.version == b.version && a.settings == b.settings
+            && a.maxDepth == b.maxDepth && a.minTile == b.minTile && a.cushion == b.cushion && a.coloring == b.coloring
+    }
+
+    var body: some View {
+        Canvas { context, size in
+            draw(layout(for: size), in: &context)
+        }
+    }
+
+    private func layout(for size: CGSize) -> [TreemapTile] {
         let key = TreemapLayoutKey(node: scope.id, version: version, size: size,
                                    depth: max(1, maxDepth), minTile: max(2, minTile), mode: settings.mode)
         let mode = settings.mode
+        let scope = self.scope
         return state.layoutTiles(for: key) {
             guard size.width > 4, size.height > 4 else { return [] }
             let metric: (Node) -> Double = { node in
@@ -244,9 +284,9 @@ struct TreemapView: View {
         return swatch.lightened(0.5 * depthFactor)
     }
 
-    private func draw(_ tiles: [TreemapTile], hovered: Int?, in context: inout GraphicsContext) {
+    private func draw(_ tiles: [TreemapTile], in context: inout GraphicsContext) {
         let gap = Color(nsColor: .windowBackgroundColor)
-        for (index, tile) in tiles.enumerated() where tile.depth > 0 {
+        for tile in tiles where tile.depth > 0 {
             let radius: CGFloat = tile.depth == 1 ? 5 : 3
             let path = Path(roundedRect: tile.rect, cornerRadius: min(radius, tile.rect.width / 3, tile.rect.height / 3))
             context.fill(path, with: .color(color(for: tile)))
@@ -258,10 +298,6 @@ struct TreemapView: View {
                                                          endPoint: CGPoint(x: tile.rect.midX, y: tile.rect.maxY)))
             }
             context.stroke(path, with: .color(gap), lineWidth: tile.depth == 1 ? 1.5 : 1)
-            if index == hovered {
-                context.fill(path, with: .color(.white.opacity(0.18)))
-                context.stroke(path, with: .color(.white), lineWidth: 2)
-            }
         }
 
         // Labels, with a soft shadow so white text stays readable on light tiles.

@@ -147,8 +147,11 @@ enum Suggestions {
 
     /// A folder whose node_modules belong to an app or tool (see `nodeModules(in:)`).
     static func isToolFolder(_ name: String) -> Bool {
-        name.hasPrefix(".") || name == "Library"
-            || bundleExtensions.contains((name as NSString).pathExtension.lowercased())
+        // Looks at the bytes directly: this runs for every folder in the scan.
+        let dot = UInt8(ascii: ".")
+        if name.utf8.first == dot || name == "Library" { return true }
+        guard let lastDot = name.utf8.lastIndex(of: dot) else { return false }
+        return bundleExtensions.contains(name[name.utf8.index(after: lastDot)...].lowercased())
     }
 
     /// Whether a whole scan sits inside a folder whose node_modules belong to an app or tool.
@@ -198,7 +201,11 @@ struct SuggestionsView: View {
     private static let listLimit = 100
 
     var body: some View {
-        let key = SuggestionsState.Key(result: ObjectIdentifier(result), version: model.version)
+        // Finding node_modules looks at every folder. While a scan fills in (the tree changes twice
+        // a second) the list is made again every few updates, and once more when the scan is done.
+        let key = SuggestionsState.Key(result: ObjectIdentifier(result),
+                                       version: result.isComplete ? model.version : model.version / 4,
+                                       complete: result.isComplete)
         let scanTotal = max(1, result.root.allocated)
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
@@ -452,6 +459,7 @@ final class SuggestionsState: ObservableObject {
     struct Key: Equatable {
         let result: ObjectIdentifier
         let version: Int
+        let complete: Bool
     }
 
     @Published var key: Key?

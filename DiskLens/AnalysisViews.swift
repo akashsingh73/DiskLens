@@ -39,7 +39,7 @@ struct FileTypesView: View {
 
     private var visibleRows: [ExtensionRow] {
         let filtered = state.groupFilter.map { group in state.rows.filter { $0.group == group } } ?? state.rows
-        return filtered.sorted(using: state.sortOrder)
+        return FastSort.sorted(filtered, using: state.sortOrder)
     }
 
     var body: some View {
@@ -181,7 +181,7 @@ struct TopFilesView: View {
 
     var body: some View {
         let total = max(1, result.root.allocated)
-        Table(result.topFiles.sorted(using: state.sortOrder), selection: $state.selection, sortOrder: $state.sortOrder) {
+        Table(FastSort.sorted(result.topFiles, using: state.sortOrder), selection: $state.selection, sortOrder: $state.sortOrder) {
             TableColumn("Name", value: \.name) { file in
                 HStack(spacing: 8) {
                     Image(nsImage: IconCache.icon(name: file.name, path: file.path, isFolder: false))
@@ -535,7 +535,7 @@ struct ChangesList: View {
     }
 
     private func table(_ comparison: FolderComparison, scan: ScanResult) -> some View {
-        Table(comparison.changes.sorted(using: state.sortOrder), selection: $state.selection, sortOrder: $state.sortOrder) {
+        Table(FastSort.sorted(comparison.changes, using: state.sortOrder), selection: $state.selection, sortOrder: $state.sortOrder) {
             TableColumn("Folder", value: \.name) { change in
                 HStack(spacing: 8) {
                     icon(for: change, scan: scan)
@@ -629,6 +629,47 @@ struct ChangesList: View {
         guard let node = folder(for: change, scan: scan) else { return }
         model.navigate(to: node)
         tab = .details
+    }
+}
+
+// MARK: - Sorting
+
+extension FileTypesView.ExtensionRow: FastSortable {
+    typealias Row = FileTypesView.ExtensionRow
+    static func sortKey(for keyPath: PartialKeyPath<Row>) -> SortKey<Row>? {
+        switch keyPath {
+        case \Row.displayName: return .text { $0.displayName }
+        case \Row.groupName: return .text { $0.groupName }
+        case \Row.allocated: return .integer { $0.allocated }
+        case \Row.share: return .real { $0.share }
+        case \Row.size: return .integer { $0.size }
+        case \Row.count: return .integer { Int64($0.count) }
+        default: return nil
+        }
+    }
+}
+
+extension TopFile: FastSortable {
+    static func sortKey(for keyPath: PartialKeyPath<TopFile>) -> SortKey<TopFile>? {
+        switch keyPath {
+        case \TopFile.name: return .text { $0.name }
+        case \TopFile.allocated: return .integer { $0.allocated }
+        case \TopFile.size: return .integer { $0.size }
+        case \TopFile.modified: return .integer { $0.modified }
+        default: return nil
+        }
+    }
+}
+
+extension FolderChange: FastSortable {
+    static func sortKey(for keyPath: PartialKeyPath<FolderChange>) -> SortKey<FolderChange>? {
+        switch keyPath {
+        case \FolderChange.name: return .text { $0.name }
+        case \FolderChange.before: return .integer { $0.before }
+        case \FolderChange.after: return .integer { $0.after }
+        case \FolderChange.amount: return .integer { $0.amount }
+        default: return nil
+        }
     }
 }
 

@@ -97,10 +97,10 @@ struct ContentView: View {
                 VStack(spacing: 10) {
                     if !model.fullDiskAccess { FullDiskAccessBanner(model: model) }
                     if let scanned {
-                        SummaryCard(result: scanned, settings: settings, volume: model.volumeInfo,
+                        SummaryCard(result: scanned, settings: settings, volume: model.volume,
                                     changes: model.changes,
                                     scanStatus: model.isShowingLiveScan ? model.status : nil,
-                                    cloud: model.cloudStatus,
+                                    cloud: model.isReadingCloud ? model.cloud : nil,
                                     stopScan: { model.cancel() },
                                     readCloud: { model.readCloudFolders() },
                                     stopCloud: { model.stopReadingCloud() }) {
@@ -342,7 +342,7 @@ struct SummaryCard: View {
     /// Set while this scan is still being read.
     let scanStatus: ScanStatus?
     /// Set while folders only in the cloud are being read after the scan.
-    let cloud: AppModel.CloudStatus?
+    let cloud: CloudReadStatus?
     let stopScan: @MainActor () -> Void
     let readCloud: @MainActor () -> Void
     let stopCloud: @MainActor () -> Void
@@ -393,7 +393,7 @@ struct SummaryCard: View {
             if let scanStatus {
                 LiveScanStrip(status: scanStatus, rootPath: result.rootPath, stop: stopScan)
             } else if let cloud {
-                CloudStrip(status: cloud, rootPath: result.rootPath, stop: stopCloud)
+                CloudStrip(cloud: cloud, rootPath: result.rootPath, stop: stopCloud)
             }
 
             if let volume, volume.total > 0 {
@@ -586,11 +586,12 @@ struct LiveScanStrip: View {
 
 /// In the summary card while folders only in the cloud are being read after a scan.
 struct CloudStrip: View {
-    let status: AppModel.CloudStatus
+    @ObservedObject var cloud: CloudReadStatus
     let rootPath: String
     let stop: @MainActor () -> Void
 
     var body: some View {
+        let status = cloud.progress
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Image(systemName: "icloud.and.arrow.down").foregroundStyle(.tint)
@@ -871,7 +872,7 @@ struct WelcomePanel: View {
     }
 
     private func subtitle(for target: AppModel.Target) -> String {
-        if target.path == "/", let volume = AppModel.volumeInfo(at: "/") {
+        if target.path == "/", let volume = model.startupVolume {
             return "\(SizeFormat.bytes(volume.available)) free of \(SizeFormat.bytes(volume.total))"
         }
         return (target.path as NSString).abbreviatingWithTildeInPath

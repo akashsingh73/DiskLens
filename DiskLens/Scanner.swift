@@ -488,19 +488,20 @@ extension FileTally {
     /// Reads the folders again and totals their files the way the scan did, using the scan's
     /// clock (`now`) so every file lands in the same age band. Stops early when cancelled.
     static func read(_ folders: [TallyFolder], now: Int64, progress: ScanProgress) -> FileTally {
-        let chunkSize = 32
-        let chunks = (folders.count + chunkSize - 1) / chunkSize
-        let slots = ResultSlots<FileTally>(count: chunks)
-        DispatchQueue.concurrentPerform(iterations: chunks) { chunk in
+        let readers = ScanEngine.readers
+        let slots = ResultSlots<FileTally>(count: readers)
+        // As many threads as a scan uses (see `ScanEngine.readers`), each taking every n-th folder.
+        DispatchQueue.concurrentPerform(iterations: readers) { reader in
             var tally = FileTally()
-            for folder in folders[(chunk * chunkSize)..<min(folders.count, (chunk + 1) * chunkSize)] {
+            for index in stride(from: reader, to: folders.count, by: readers) {
                 if progress.isCancelled { break }
+                let folder = folders[index]
                 for file in FolderReader.files(in: folder.path, uncounted: folder.uncounted) ?? [] where file.counted {
                     tally.add(ext: NameTools.fileExtension(of: file.name), size: file.facts.size,
                               allocated: file.facts.allocated, modified: file.facts.modified, now: now)
                 }
             }
-            slots.set(chunk, tally)
+            slots.set(reader, tally)
         }
         var total = FileTally()
         for tally in slots.all() { total.merge(tally) }

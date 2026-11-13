@@ -37,6 +37,23 @@ struct DetailItem: Identifiable, Hashable, Sendable {
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
+extension DetailItem: FastSortable {
+    static func sortKey(for keyPath: PartialKeyPath<DetailItem>) -> SortKey<DetailItem>? {
+        switch keyPath {
+        case \DetailItem.name: return .text { $0.name }
+        case \DetailItem.allocated: return .integer { $0.allocated }
+        case \DetailItem.changeSortKey: return .integer { $0.changeSortKey }
+        case \DetailItem.percent: return .real { $0.percent }
+        case \DetailItem.size: return .integer { $0.size }
+        case \DetailItem.files: return .integer { Int64($0.files) }
+        case \DetailItem.folders: return .integer { Int64($0.folders) }
+        case \DetailItem.modified: return .real { $0.modified.timeIntervalSinceReferenceDate }
+        case \DetailItem.kind: return .text { $0.kind }
+        default: return nil
+        }
+    }
+}
+
 /// Reads the files of one folder off the main thread.
 enum DetailLoader {
     /// Folders with more files than this list only the largest ones, so the list stays fast.
@@ -348,6 +365,15 @@ struct DetailsView: View {
 
     private func reload() async {
         let directory = node.directory
+        // While a scan fills in, the tree changes twice a second, mostly somewhere else: the folder
+        // shown here is listed again only if something in it changed.
+        let signature = DetailsState.Signature(directory, filesOnly: node.kind == .files,
+                                               comparedWith: model.changes?.base.date)
+        if state.shownFolder == ObjectIdentifier(directory), state.shownSignature == signature,
+           state.listedFolder != nil {
+            return
+        }
+        state.shownSignature = nil
         let path = directory.path
         state.listedFolder = nil
         let total = directory.allocated
@@ -400,6 +426,7 @@ struct DetailsView: View {
             state.hiddenFiles = max(0, cached.listing.total - cached.listing.items.count)
             state.loading = false
             state.listedFolder = path
+            state.shownSignature = signature
             showPendingFile()
             return
         }
@@ -409,6 +436,7 @@ struct DetailsView: View {
         guard directory.ownFileCount > 0, !directory.unreadable else {
             state.loading = false
             state.listedFolder = path
+            state.shownSignature = signature
             showPendingFile()
             return
         }
@@ -426,6 +454,7 @@ struct DetailsView: View {
         state.hiddenFiles = max(0, listing.total - listing.items.count)
         state.loading = false
         state.listedFolder = path
+        state.shownSignature = signature
         showPendingFile()
     }
 }
@@ -475,7 +504,7 @@ final class DetailsState: ObservableObject {
     @Published var folderLookup: [String: Node] = [:]
     @Published var selection = Set<DetailItem.ID>()
     @Published var sortOrder = [KeyPathComparator(\DetailItem.allocated, order: .reverse)] {
-        didSet { rows = items.sorted(using: sortOrder) }
+        didSet { rows = FastSort.sorted(items, using: sortOrder) }
     }
     @Published var columns = TableColumnCustomization<DetailItem>()
     @Published var previewURL: URL?
@@ -485,6 +514,8 @@ final class DetailsState: ObservableObject {
     var listedFolder: String?
     /// The folder shown last, to tell a new folder from the same one redrawn (while a scan fills in).
     var shownFolder: ObjectIdentifier?
+    /// What the rows were made from, to skip listing the folder again when nothing in it changed.
+    var shownSignature: Signature?
     /// The files of the folder read last, reused while its own files stay the same.
     var cachedFiles: (folder: ObjectIdentifier, ownFiles: Int, ownAllocated: Int64, listing: DetailLoader.Listing)?
     @Published var loading = false
@@ -492,9 +523,39 @@ final class DetailsState: ObservableObject {
     @Published var hiddenFiles = 0
     private var items: [DetailItem] = []
 
+    /// Everything about a folder its rows show. When this is the same, so are the rows.
+    struct Signature: Equatable {
+        let size: Int64
+        let allocated: Int64
+        let files: Int
+        let folders: Int
+        let newest: Int64
+        let subfolders: Int
+        /// Subfolders still being read or only in the cloud: they change kind without changing size.
+        let unfinished: Int
+        /// Hard links counted elsewhere: moving one to the Trash changes the list, not the totals.
+        let uncountedLinks: Int
+        /// Showing only the folder's own files (its "[Files]" entry), not its subfolders.
+        let filesOnly: Bool
+        let comparedWith: Date?
+
+        init(_ folder: Node, filesOnly: Bool, comparedWith: Date?) {
+            size = folder.size
+            allocated = folder.allocated
+            files = folder.fileCount
+            folders = folder.folderCount
+            newest = folder.newest
+            subfolders = folder.children.count
+            unfinished = folder.children.reduce(0) { $0 + ($1.pending || $1.cloudOnly ? 1 : 0) }
+            uncountedLinks = folder.uncountedLinks?.values.reduce(0, +) ?? 0
+            self.filesOnly = filesOnly
+            self.comparedWith = comparedWith
+        }
+    }
+
     /// Sorted once here rather than on every redraw: a folder can hold tens of thousands of files.
     func show(_ newItems: [DetailItem]) {
         items = newItems
-        rows = newItems.sorted(using: sortOrder)
+        rows = FastSort.sorted(newItems, using: sortOrder)
     }
 }
