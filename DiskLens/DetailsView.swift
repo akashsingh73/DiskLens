@@ -20,8 +20,15 @@ struct DetailItem: Identifiable, Hashable, Sendable {
     /// Set for a hard link whose space the scan counted through another link to the same file.
     /// Its On Disk is 0, because moving it to the Trash frees nothing.
     var uncountedLink: FileKey? = nil
+    /// How a folder changed since the earlier scan History compares with; nil when that scan
+    /// didn't record it (and for files).
+    var change: FolderChange? = nil
 
-    static func == (lhs: DetailItem, rhs: DetailItem) -> Bool { lhs.id == rhs.id }
+    /// Biggest growth first when sorted descending; rows with nothing to compare come last.
+    var changeSortKey: Int64 { change?.change ?? Int64.min }
+
+    /// The path, plus the change: it arrives a moment after a scan, and the table only redraws rows that differ.
+    static func == (lhs: DetailItem, rhs: DetailItem) -> Bool { lhs.id == rhs.id && lhs.change == rhs.change }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
@@ -135,6 +142,8 @@ struct DetailsView: View {
     private struct LoadKey: Equatable {
         let node: ObjectIdentifier
         let version: Int
+        /// The earlier scan the Change column compares with.
+        let comparedWith: Date?
     }
 
     var body: some View {
@@ -151,7 +160,7 @@ struct DetailsView: View {
                     .frame(height: 24)
             }
         }
-        .task(id: LoadKey(node: node.id, version: model.version)) {
+        .task(id: LoadKey(node: node.id, version: model.version, comparedWith: model.changes?.base.date)) {
             await reload()
         }
     }
@@ -178,6 +187,14 @@ struct DetailsView: View {
             }
             .width(min: 70, ideal: 80)
             .customizationID("allocated")
+
+            TableColumn("Change", value: \.changeSortKey) { item in
+                if let change = item.change {
+                    changeCell(change)
+                }
+            }
+            .width(min: 80, ideal: 100)
+            .customizationID("change")
 
             TableColumn("% of Parent", value: \.percent) { item in
                 PercentBar(fraction: item.percent, settings: settings)
@@ -228,6 +245,29 @@ struct DetailsView: View {
         }
         .overlay {
             if state.loading && state.rows.isEmpty { ProgressView() }
+        }
+    }
+
+    /// The Change column: how the folder changed since the earlier scan, like History's Change column.
+    @ViewBuilder
+    private func changeCell(_ change: FolderChange) -> some View {
+        let since = model.changes.map { Theme.shortDate($0.base.date) } ?? "the last scan"
+        switch change.kind {
+        case .added:
+            ChangeLabel(change: change.change, settings: settings)
+                .help("New since \(since)")
+        case .renamed:
+            ChangeLabel(change: change.change, settings: settings)
+                .help("Called “\(change.oldName ?? "")” on \(since), when it took \(settings.bytes(change.before))")
+        default:
+            if change.change == 0 {
+                Text("–")
+                    .foregroundStyle(.tertiary)
+                    .help("No change since \(since)")
+            } else {
+                ChangeLabel(change: change.change, settings: settings)
+                    .help("\(settings.bytes(change.before)) on \(since)")
+            }
         }
     }
 
@@ -282,6 +322,8 @@ struct DetailsView: View {
         let path = directory.path
         let total = directory.allocated
         let uncounted = directory.uncountedLinks
+        let comparison = model.changes
+        let rootPath = model.result?.rootPath
         var folderRows: [DetailItem] = []
         var lookup: [String: Node] = [:]
         if node.kind == .directory {
@@ -290,6 +332,7 @@ struct DetailsView: View {
                 let childPath = (path as NSString).appendingPathComponent(child.name)
                 lookup[childPath] = child
                 let kind = child.otherVolume ? "Other disk" : (child.unreadable ? "No access" : "Folder")
+                let relative = rootPath.flatMap { FolderSnapshot.relativePath(of: childPath, inside: $0) }
                 folderRows.append(DetailItem(
                     id: childPath, name: child.name, isFolder: true,
                     size: child.size, allocated: child.allocated,
@@ -297,7 +340,8 @@ struct DetailsView: View {
                     modified: Date(timeIntervalSince1970: TimeInterval(child.newest)),
                     kind: kind,
                     percent: total > 0 ? Double(child.allocated) / Double(total) : 0,
-                    unreadable: child.unreadable))
+                    unreadable: child.unreadable,
+                    change: relative.flatMap { comparison?.change(at: $0) }))
             }
         }
         state.folderLookup = lookup

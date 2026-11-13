@@ -191,7 +191,8 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
 enum HistoryStore {
     private static let limit = 5000
 
-    private static var folderURL: URL {
+    /// Where DiskLens keeps its scan history (and the folder snapshots, see `SnapshotStore`).
+    static var folderURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
         return base.appendingPathComponent("DiskLens", isDirectory: true)

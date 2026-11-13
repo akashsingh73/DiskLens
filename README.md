@@ -74,6 +74,10 @@ ad-hoc signature, so use `build.sh` for the copy you keep in Applications.
 - **File Types** by group and extension, **Top Files** (the 100 largest by default, each with the app or folder it
   lives in), **Ages** (by modification date, including how much hasn't changed in a year) and **History** (a point
   per scan, so you can watch a folder grow).
+- **What changed since the last scan**: scan a folder again and History lists the folders that grew, shrank,
+  appeared, disappeared or were renamed, biggest change first. Details gets a Change column, and the summary card
+  shows how much the whole folder changed. DiskLens compares the largest folders in the top four levels; a folder
+  scanned before as part of a bigger scan is compared with that.
 - **Recent scans** on the start screen, to scan a folder again with one click.
 - **Clean up safely**: right-click anything to reveal it in Finder, open it, Quick Look it, copy its path, or move
   it to the Trash. DiskLens always asks first, never deletes outright, and refuses system folders and your home
@@ -110,8 +114,10 @@ ad-hoc signature, so use `build.sh` for the copy you keep in Applications.
 
 - DiskLens makes no network connections.
 - It reads file names, sizes, dates and icons. It opens a file only when you ask it to (Open or Quick Look).
-- It keeps a small scan history (one total per scan) in `~/Library/Application Support/DiskLens/history.json`,
-  and its settings in the macOS defaults domain `local.disklens.app`. Nothing else is stored.
+- It keeps a small scan history in `~/Library/Application Support/DiskLens`: one total per scan in `history.json`,
+  and, for the last two scans of the ten folders you scanned most recently, the names and sizes of their largest
+  subfolders in `snapshots.json` (at most 3 MB), so it can show what changed. Its settings are in the macOS defaults
+  domain `local.disklens.app`. Nothing else is stored.
 
 ## Uninstall
 
@@ -175,6 +181,7 @@ A few rules keep DiskLens stable; please keep to them:
 | `DiskLens/ContentView.swift`, `AppModel.swift`, `DiskLensApp.swift` | Window layout, tabs, summary card, start and scanning screens, navigation history, scan control, menus |
 | `DiskLens/Theme.swift` | The look: colour palette, cards, chips, icons for file types |
 | `DiskLens/Support.swift` | Logging, file type groups, Finder actions, Full Disk Access check, scan history |
+| `DiskLens/FolderChanges.swift` | Folder snapshots, comparing two scans, and storing the snapshots |
 | `DiskLens/AppIcon.icns`, `Tools/make-icon.swift` | The app icon, and the script that draws it (`swift Tools/make-icon.swift`) |
 | `DiskLens/Info.plist` | The icon setting Xcode merges into its generated Info.plist (`build.sh` writes its own) |
 

@@ -192,6 +192,52 @@ struct ShareBar: View {
     }
 }
 
+// MARK: - Changes between scans
+
+extension Theme {
+    /// Orange where space was taken, green where it was freed, grey for no change.
+    static func changeColor(_ change: Int64) -> Color {
+        change > 0 ? Color.orange : (change < 0 ? Color.green : Color.secondary)
+    }
+
+    static func changeSymbol(_ change: Int64) -> String {
+        change > 0 ? "arrow.up.right" : (change < 0 ? "arrow.down.right" : "equal")
+    }
+
+    /// "14:05" for today, "10 Nov" for this year, "10 Nov 2025" before that: when an earlier scan was.
+    static func shortDate(_ date: Date, now: Date = Date()) -> String {
+        let calendar = Calendar.current
+        if calendar.isDate(date, inSameDayAs: now) { return date.formatted(date: .omitted, time: .shortened) }
+        if calendar.component(.year, from: date) == calendar.component(.year, from: now) {
+            return date.formatted(.dateTime.day().month(.abbreviated))
+        }
+        return date.formatted(.dateTime.day().month(.abbreviated).year())
+    }
+}
+
+extension DisplaySettings {
+    /// "+1.2 GB", "−300 MB", "+0 B".
+    func signedBytes(_ change: Int64) -> String {
+        (change >= 0 ? "+" : "−") + bytes(abs(change))
+    }
+}
+
+/// A change in size with an arrow, coloured by direction: "↗ +1.2 GB" or "↘ −300 MB".
+struct ChangeLabel: View {
+    let change: Int64
+    let settings: DisplaySettings
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: Theme.changeSymbol(change))
+            Text(settings.signedBytes(change))
+                .monospacedDigit()
+        }
+        .foregroundStyle(Theme.changeColor(change))
+        .lineLimit(1)
+    }
+}
+
 // MARK: - File type groups
 
 extension FileGroup {
