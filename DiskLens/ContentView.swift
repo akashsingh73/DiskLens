@@ -8,9 +8,10 @@ enum DetailTab: String, CaseIterable, Identifiable {
     case top = "Top Files"
     case ages = "Ages"
     case history = "History"
+    case suggestions = "Suggestions"
     var id: String { rawValue }
 
-    /// ⌘1 … ⌘7 in the View menu.
+    /// ⌘1 … ⌘8 in the View menu.
     var key: Character {
         switch self {
         case .details: return "1"
@@ -20,6 +21,7 @@ enum DetailTab: String, CaseIterable, Identifiable {
         case .top: return "5"
         case .ages: return "6"
         case .history: return "7"
+        case .suggestions: return "8"
         }
     }
 
@@ -32,6 +34,7 @@ enum DetailTab: String, CaseIterable, Identifiable {
         case .top: return "list.number"
         case .ages: return "clock"
         case .history: return "chart.line.uptrend.xyaxis"
+        case .suggestions: return "lightbulb"
         }
     }
 }
@@ -86,8 +89,11 @@ struct ContentView: View {
                 VStack(spacing: 10) {
                     if !model.fullDiskAccess { FullDiskAccessBanner(model: model) }
                     if let scanned {
-                        SummaryCard(result: scanned, settings: settings, volume: model.volumeInfo) {
+                        SummaryCard(result: scanned, settings: settings, volume: model.volumeInfo,
+                                    changes: model.changes) {
                             model.showingUnreadable = true
+                        } showChanges: {
+                            tab = .history
                         }
                     }
                 }
@@ -135,6 +141,11 @@ struct ContentView: View {
                         AgesView(result: result, version: model.version, settings: settings)
                     case .history:
                         HistoryView(model: model, settings: settings)
+                    case .suggestions:
+                        SuggestionsView(model: model, result: result, settings: settings) { folder in
+                            model.navigate(to: folder)
+                            tab = .details
+                        }
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -211,7 +222,10 @@ struct SummaryCard: View {
     let result: ScanResult
     let settings: DisplaySettings
     let volume: AppModel.VolumeInfo?
+    /// What changed since an earlier scan of the same folder, if there was one.
+    let changes: FolderComparison?
     let showUnreadable: @MainActor () -> Void
+    let showChanges: @MainActor () -> Void
 
     var body: some View {
         let root = result.root
@@ -236,6 +250,22 @@ struct SummaryCard: View {
                 Text("on disk")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+            }
+
+            if let changes {
+                Button(action: showChanges) {
+                    HStack(spacing: 6) {
+                        ChangeLabel(change: changes.totalChange, settings: settings)
+                        Text("since \(Theme.shortDate(changes.base.date))")
+                            .foregroundStyle(.secondary)
+                        Image(systemName: "chevron.right").imageScale(.small).foregroundStyle(.tertiary)
+                    }
+                    .font(.callout)
+                    .lineLimit(1)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Show which folders grew or shrank since the scan of \(changes.base.date.formatted(date: .abbreviated, time: .shortened))")
             }
 
             if let volume, volume.total > 0 {

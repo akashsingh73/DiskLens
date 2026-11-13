@@ -342,10 +342,12 @@ struct AgesView: View {
 
 // MARK: - History
 
-/// Space used by the scanned folder across past scans.
+/// Space used by the scanned folder across past scans, and which folders changed since an earlier scan.
 struct HistoryView: View {
     @ObservedObject var model: AppModel
     let settings: DisplaySettings
+
+    @StateObject private var state = HistoryState()
 
     struct Row: Identifiable {
         let entry: HistoryEntry
@@ -355,66 +357,278 @@ struct HistoryView: View {
 
     var body: some View {
         let entries = model.history
-        let rows: [Row] = entries.enumerated().map { index, entry in
-            Row(entry: entry, change: index > 0 ? entry.allocated - entries[index - 1].allocated : nil)
-        }.reversed()
-
         VStack(alignment: .leading, spacing: 12) {
             SectionTitle(title: "Space over time", systemImage: "chart.line.uptrend.xyaxis",
                          detail: SizeFormat.count(entries.count, "scan"))
             if entries.count < 2 {
                 ContentUnavailableView("Not enough history yet", systemImage: "chart.line.uptrend.xyaxis",
                                        description: Text("Every scan of this folder adds a point. Scan it again later to see the trend."))
-                    .frame(maxHeight: 220)
+                    .frame(maxHeight: 140)
             } else {
-                Chart(entries) { entry in
-                    AreaMark(x: .value("Date", entry.date), y: .value("On disk", Double(entry.allocated)))
-                        .foregroundStyle(LinearGradient(colors: [Color.accentColor.opacity(0.28), Color.accentColor.opacity(0.02)],
-                                                        startPoint: .top, endPoint: .bottom))
-                        .interpolationMethod(.monotone)
-                    LineMark(x: .value("Date", entry.date), y: .value("On disk", Double(entry.allocated)))
-                        .foregroundStyle(Color.accentColor)
-                        .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round))
-                        .interpolationMethod(.monotone)
-                    PointMark(x: .value("Date", entry.date), y: .value("On disk", Double(entry.allocated)))
-                        .foregroundStyle(Color.accentColor)
-                        .symbolSize(30)
-                }
-                .chartYAxis {
-                    AxisMarks { value in
-                        AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [3, 3]))
-                        AxisValueLabel {
-                            if let amount = value.as(Double.self) { Text(settings.bytes(Int64(amount))) }
-                        }
-                    }
-                }
-                .frame(minHeight: 200)
-                .card(padding: 16)
+                chart(entries)
+                    .frame(minHeight: 110, idealHeight: 170, maxHeight: 200)
+                    .card(padding: 16)
             }
 
-            Table(rows) {
-                TableColumn("Scanned") { row in
-                    Text(row.entry.date, format: .dateTime.year().month(.abbreviated).day().hour().minute())
+            HStack(spacing: 10) {
+                Picker("Show", selection: $state.shown) {
+                    Text("Changes").tag(HistoryState.Shown.changes)
+                    Text("Scans").tag(HistoryState.Shown.scans)
                 }
-                TableColumn("On Disk") { row in
-                    Text(settings.bytes(row.entry.allocated)).monospacedDigit()
-                }
-                TableColumn("Change") { row in
-                    if let change = row.change {
-                        HStack(spacing: 4) {
-                            Image(systemName: change > 0 ? "arrow.up.right" : (change < 0 ? "arrow.down.right" : "equal"))
-                            Text((change >= 0 ? "+" : "−") + settings.bytes(abs(change)))
-                                .monospacedDigit()
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                Spacer(minLength: 8)
+                if state.shown == .changes, let bases = model.comparisonBases, bases.count > 1 {
+                    let labels = Self.labels(for: bases.map(\.date))
+                    Picker("Compare with", selection: $model.comparisonIndex) {
+                        ForEach(bases.indices, id: \.self) { index in
+                            Text(labels[index]).tag(index)
                         }
-                        .foregroundStyle(change > 0 ? Color.orange : (change < 0 ? Color.green : Color.secondary))
                     }
+                    .pickerStyle(.menu)
+                    .fixedSize()
+                    .help("Which earlier scan to compare this one with")
                 }
-                TableColumn("Files") { row in
-                    Text(SizeFormat.count(row.entry.files)).monospacedDigit()
-                }
+            }
+
+            switch state.shown {
+            case .changes:
+                ChangesList(model: model, settings: settings)
+            case .scans:
+                scans(entries)
             }
         }
         .padding()
+    }
+
+    /// Dates of earlier scans for the "Compare with" menu, with seconds when two fall in the same minute.
+    static func labels(for dates: [Date]) -> [String] {
+        let minutes = dates.map { $0.formatted(.dateTime.year().month(.abbreviated).day().hour().minute()) }
+        guard Set(minutes).count < minutes.count else { return minutes }
+        return dates.map { $0.formatted(.dateTime.year().month(.abbreviated).day().hour().minute().second()) }
+    }
+
+    private func chart(_ entries: [HistoryEntry]) -> some View {
+        Chart(entries) { entry in
+            AreaMark(x: .value("Date", entry.date), y: .value("On disk", Double(entry.allocated)))
+                .foregroundStyle(LinearGradient(colors: [Color.accentColor.opacity(0.28), Color.accentColor.opacity(0.02)],
+                                                startPoint: .top, endPoint: .bottom))
+                .interpolationMethod(.monotone)
+            LineMark(x: .value("Date", entry.date), y: .value("On disk", Double(entry.allocated)))
+                .foregroundStyle(Color.accentColor)
+                .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                .interpolationMethod(.monotone)
+            PointMark(x: .value("Date", entry.date), y: .value("On disk", Double(entry.allocated)))
+                .foregroundStyle(Color.accentColor)
+                .symbolSize(30)
+        }
+        .chartYAxis {
+            AxisMarks { value in
+                AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [3, 3]))
+                AxisValueLabel {
+                    if let amount = value.as(Double.self) { Text(settings.bytes(Int64(amount))) }
+                }
+            }
+        }
+    }
+
+    private func scans(_ entries: [HistoryEntry]) -> some View {
+        let rows: [Row] = entries.enumerated().map { index, entry in
+            Row(entry: entry, change: index > 0 ? entry.allocated - entries[index - 1].allocated : nil)
+        }.reversed()
+        return Table(rows) {
+            TableColumn("Scanned") { row in
+                Text(row.entry.date, format: .dateTime.year().month(.abbreviated).day().hour().minute())
+            }
+            TableColumn("On Disk") { row in
+                Text(settings.bytes(row.entry.allocated)).monospacedDigit()
+            }
+            TableColumn("Change") { row in
+                if let change = row.change {
+                    ChangeLabel(change: change, settings: settings)
+                }
+            }
+            TableColumn("Files") { row in
+                Text(SizeFormat.count(row.entry.files)).monospacedDigit()
+            }
+        }
+    }
+}
+
+/// "Changes since …": the folders that grew, shrank, appeared, disappeared or were renamed since an
+/// earlier scan of the same folder, biggest change first.
+struct ChangesList: View {
+    @ObservedObject var model: AppModel
+    let settings: DisplaySettings
+
+    @StateObject private var state = ChangesState()
+    @AppStorage("detailTab") private var tab: DetailTab = .details
+
+    var body: some View {
+        if let comparison = model.changes, let scan = model.result {
+            VStack(alignment: .leading, spacing: 10) {
+                header(comparison, scan: scan)
+                if comparison.changes.isEmpty {
+                    ContentUnavailableView("No folder changed", systemImage: "checkmark.circle",
+                                           description: Text("The folders DiskLens keeps track of are the same size as on \(Theme.shortDate(comparison.base.date))."))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    table(comparison, scan: scan)
+                }
+            }
+        } else if model.comparisonBases == nil {
+            ProgressView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ContentUnavailableView("Nothing to compare with yet", systemImage: "arrow.up.arrow.down",
+                                   description: Text("After every scan, DiskLens remembers how big this folder's largest subfolders are. Scan it again later to see which ones grew or shrank."))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func header(_ comparison: FolderComparison, scan: ScanResult) -> some View {
+        let base = comparison.base
+        let source = base.partOf.map { "from a scan of " + FileManager.default.displayName(atPath: $0) }
+        return VStack(alignment: .leading, spacing: 8) {
+            SectionTitle(title: "Changes since " + base.date.formatted(.dateTime.year().month(.abbreviated).day().hour().minute()),
+                         systemImage: "arrow.up.arrow.down", detail: source)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 6) {
+                    totalChip(comparison)
+                    countChips(comparison, all: true)
+                }
+                HStack(spacing: 6) {
+                    totalChip(comparison)
+                    countChips(comparison, all: false)
+                }
+                totalChip(comparison)
+            }
+        }
+    }
+
+    private func totalChip(_ comparison: FolderComparison) -> some View {
+        Chip(text: settings.signedBytes(comparison.totalChange) + " in all",
+             systemImage: Theme.changeSymbol(comparison.totalChange), tint: Theme.changeColor(comparison.totalChange))
+            .help("\(model.result?.displayName ?? "This folder") was \(settings.bytes(comparison.base.allocated)) then")
+    }
+
+    @ViewBuilder
+    private func countChips(_ comparison: FolderComparison, all: Bool) -> some View {
+        if comparison.grew > 0 {
+            Chip(text: "\(SizeFormat.count(comparison.grew)) grew", systemImage: "arrow.up.right", tint: .orange)
+        }
+        if comparison.shrank > 0 {
+            Chip(text: "\(SizeFormat.count(comparison.shrank)) shrank", systemImage: "arrow.down.right", tint: .green)
+        }
+        if all {
+            if comparison.added > 0 {
+                Chip(text: "\(SizeFormat.count(comparison.added)) new", systemImage: "plus")
+            }
+            if comparison.removed > 0 {
+                Chip(text: "\(SizeFormat.count(comparison.removed)) removed", systemImage: "minus")
+            }
+            if comparison.renamed > 0 {
+                Chip(text: "\(SizeFormat.count(comparison.renamed)) renamed", systemImage: "pencil")
+            }
+        }
+    }
+
+    private func table(_ comparison: FolderComparison, scan: ScanResult) -> some View {
+        Table(comparison.changes.sorted(using: state.sortOrder), selection: $state.selection, sortOrder: $state.sortOrder) {
+            TableColumn("Folder", value: \.name) { change in
+                HStack(spacing: 8) {
+                    icon(for: change, scan: scan)
+                        .frame(width: 18, height: 18)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(change.name)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .foregroundStyle(change.kind == .removed ? Color.secondary : Color.primary)
+                        Text(detail(for: change, scan: scan))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+                .padding(.vertical, 2)
+                .help(PathDisplay.friendly(FolderSnapshot.absolutePath(of: change.path, inside: scan.rootPath)))
+            }
+            .width(min: 160, ideal: 220)
+            TableColumn("Before", value: \.before) { change in
+                Text(change.kind == .added ? "—" : settings.bytes(change.before))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .width(min: 64, ideal: 80)
+            TableColumn("Now", value: \.after) { change in
+                Text(change.kind == .removed ? "—" : settings.bytes(change.after))
+                    .monospacedDigit()
+            }
+            .width(min: 64, ideal: 80)
+            TableColumn("Change", value: \.amount) { change in
+                ChangeLabel(change: change.change, settings: settings)
+            }
+            .width(min: 90, ideal: 100)
+        }
+        .contextMenu(forSelectionType: FolderChange.ID.self) { ids in
+            if let change = comparison.changes.first(where: { ids.contains($0.id) }) {
+                let path = FolderSnapshot.absolutePath(of: change.path, inside: scan.rootPath)
+                Button("Show in Details") { show(change, scan: scan) }
+                    .disabled(folder(for: change, scan: scan) == nil)
+                Button("Reveal in Finder") { FileActions.reveal(path) }
+                    .disabled(change.kind == .removed)
+                Button("Copy Path") { FileActions.copyPath(path) }
+            }
+        } primaryAction: { ids in
+            if let change = comparison.changes.first(where: { ids.contains($0.id) }) { show(change, scan: scan) }
+        }
+    }
+
+    @ViewBuilder
+    private func icon(for change: FolderChange, scan: ScanResult) -> some View {
+        switch change.kind {
+        case .files:
+            Image(systemName: "doc.on.doc")
+                .foregroundStyle(.secondary)
+        case .removed:
+            Image(nsImage: IconCache.icon(name: change.name, path: "", isFolder: true))
+                .resizable()
+                .opacity(0.45)
+        default:
+            Image(nsImage: IconCache.icon(name: change.name,
+                                          path: FolderSnapshot.absolutePath(of: change.path, inside: scan.rootPath),
+                                          isFolder: true))
+                .resizable()
+        }
+    }
+
+    /// Where the folder is, and what happened to it: "Library › Caches · New folder".
+    private func detail(for change: FolderChange, scan: ScanResult) -> String {
+        let location = change.folder.isEmpty
+            ? scan.displayName
+            : change.folder.split(separator: "/").joined(separator: " › ")
+        switch change.kind {
+        case .changed: return location
+        case .files: return "Files directly in " + location
+        case .added: return location + " · New folder"
+        case .removed: return location + " · Removed"
+        case .renamed: return location + " · Renamed from “\(change.oldName ?? "")”"
+        }
+    }
+
+    /// The folder in the current scan that a row is about (for loose files, their folder).
+    private func folder(for change: FolderChange, scan: ScanResult) -> Node? {
+        guard change.kind != .removed else { return nil }
+        return scan.root.descendant(atPath: FolderSnapshot.absolutePath(of: change.path, inside: scan.rootPath))
+    }
+
+    /// Opens the folder in Details.
+    private func show(_ change: FolderChange, scan: ScanResult) {
+        guard let node = folder(for: change, scan: scan) else { return }
+        model.navigate(to: node)
+        tab = .details
     }
 }
 
@@ -430,4 +644,14 @@ final class TopFilesState: ObservableObject {
     @Published var selection = Set<TopFile.ID>()
     @Published var sortOrder = [KeyPathComparator(\TopFile.allocated, order: .reverse)]
     @Published var previewURL: URL?
+}
+
+final class HistoryState: ObservableObject {
+    enum Shown: Hashable { case changes, scans }
+    @Published var shown = Shown.changes
+}
+
+final class ChangesState: ObservableObject {
+    @Published var selection = Set<FolderChange.ID>()
+    @Published var sortOrder = [KeyPathComparator(\FolderChange.amount, order: .reverse)]
 }

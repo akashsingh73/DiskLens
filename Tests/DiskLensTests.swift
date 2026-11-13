@@ -13,6 +13,7 @@ struct DiskLensTests {
     static func main() {
         let checks = Checks()
         unitTests(checks)
+        changeTests(checks)
         do {
             let fixture = try Fixture()
             defer { fixture.remove() }
@@ -75,6 +76,8 @@ struct DiskLensTests {
         for path in [home + "/Downloads/old-project", "/Applications/Some App.app", "/Volumes/Backup/Old"] {
             c.expect(!FileActions.isProtected(path), "\(path) should not be protected")
         }
+
+        suggestionTests(c)
 
         c.section("Scan failures")
         let cancelled = ScanProgress()
@@ -173,6 +176,378 @@ struct DiskLensTests {
         c.equal(SearchIndex.components(of: "/Volumes/X/a", below: "/"), ["Volumes", "X", "a"], "below /")
         c.equal(SearchIndex.join("/", ["a", "b"]), "/a/b", "joining onto /")
         c.equal(SearchIndex.join("/scan", []), "/scan", "joining nothing")
+    }
+
+    // MARK: - Changes since an earlier scan
+
+    /// A tree for the snapshot tests: every folder's relative path, with the space its own files take.
+    /// Parents must be listed too ("" is the scanned folder).
+    static func tree(_ folders: [String: Int64], root rootPath: String = "/scan") -> Node {
+        let root = Node(name: "scan", parent: nil)
+        root.rootPath = rootPath
+        root.ownAllocated = folders[""] ?? 0
+        var nodes: [String: Node] = ["": root]
+        var order: [Node] = []
+        for path in folders.keys.sorted(by: { ($0.utf8.count, $0) < ($1.utf8.count, $1) }) where !path.isEmpty {
+            let (parentPath, name) = FolderSnapshot.split(path)
+            guard let parent = nodes[parentPath] else { continue }
+            let node = Node(name: name, parent: parent)
+            node.ownAllocated = folders[path] ?? 0
+            parent.children.append(node)
+            nodes[path] = node
+            order.append(node)
+        }
+        for node in order.reversed() { node.finalize() }
+        root.finalize()
+        return root
+    }
+
+    @MainActor
+    static func changeTests(_ c: Checks) {
+        let earlier = Date(timeIntervalSince1970: 1_700_000_000)
+        let later = earlier.addingTimeInterval(86_400)
+
+        c.section("Folder snapshots")
+        let small = tree(["": 10, "a": 100, "a/b": 50, "a/b/c": 5, "d": 0, "big": 1000, "big/x": 10])
+        let snapshot = FolderSnapshot(root: small, path: "/scan", date: earlier)
+        c.equal(snapshot.allocated, 1175, "total")
+        c.equal(snapshot.children[""], ["a": 155, "d": 0, "big": 1010], "the scanned folder's child folders")
+        c.equal(snapshot.allocated(at: "a/b"), 55, "a folder two levels down")
+        c.equal(snapshot.allocated(at: "a/b/c"), 5, "three levels down")
+        c.equal(snapshot.allocated(at: "nope"), nil, "a folder that isn't there")
+        c.expect(snapshot.isOpened("a/b/c") && snapshot.isOpened("d"), "folders without subfolders are opened (nothing missing)")
+        c.equal(FolderSnapshot(root: small, path: "/scan", date: earlier), snapshot, "the same tree gives the same snapshot")
+        if let data = try? JSONEncoder().encode(snapshot) {
+            c.equal(try? JSONDecoder().decode(FolderSnapshot.self, from: data), snapshot, "a snapshot survives saving and loading")
+        } else {
+            c.fail("couldn't encode a snapshot")
+        }
+
+        let shallow = FolderSnapshot(root: small, path: "/scan", date: earlier, maxDepth: 1)
+        c.equal(shallow.children.keys.sorted(), [""], "maxDepth 1 opens only the scanned folder")
+        c.equal(shallow.allocated(at: "a"), 155, "but records its child folders")
+
+        let wide = tree(["": 0, "big": 1000, "big/1": 1, "big/2": 1, "big/3": 1, "big/4": 1, "big/5": 1,
+                         "a": 100, "a/b": 50, "a/b/c": 5, "z": 1])
+        let limited = FolderSnapshot(root: wide, path: "/scan", date: earlier, limit: 6)
+        c.expect(!limited.isOpened("big"), "a folder whose children don't fit isn't opened")
+        c.expect(limited.isOpened("a") && limited.isOpened("a/b"), "smaller folders that fit still are")
+        c.expect(limited.folderCount <= 6, "the snapshot stays within its limit (\(limited.folderCount) folders)")
+        c.equal(limited.allocated(at: "big"), 1005, "the unopened folder's own size is still recorded")
+
+        let locked = tree(["": 0, "locked": 0, "disk": 0, "fine": 1])
+        locked.children.first { $0.name == "locked" }?.unreadable = true
+        locked.children.first { $0.name == "disk" }?.otherVolume = true
+        let lockedSnapshot = FolderSnapshot(root: locked, path: "/scan", date: earlier)
+        c.expect(!lockedSnapshot.isOpened("locked") && !lockedSnapshot.isOpened("disk"),
+                 "unreadable folders and other disks are never opened")
+        c.expect(lockedSnapshot.isOpened("fine"), "a readable empty folder is")
+
+        c.section("Paths inside a scan")
+        c.equal(FolderSnapshot.relativePath(of: "/scan/a/b", inside: "/scan"), "a/b", "relative path")
+        c.equal(FolderSnapshot.relativePath(of: "/scan", inside: "/scan"), "", "the scanned folder itself")
+        c.equal(FolderSnapshot.relativePath(of: "/scanner/a", inside: "/scan"), nil, "a folder next to it, with a longer name")
+        c.equal(FolderSnapshot.relativePath(of: "/Users", inside: "/"), "Users", "inside the root of a disk")
+        c.equal(FolderSnapshot.absolutePath(of: "Users", inside: "/"), "/Users", "and back")
+        c.equal(FolderSnapshot.absolutePath(of: "", inside: "/scan"), "/scan", "the scanned folder's own path")
+
+        c.section("Comparing two scans")
+        let before = tree(["": 10, "a": 100, "a/b": 50, "gone": 300, "old-name": 400, "same": 7,
+                           "shrinks": 900, "files-only": 20])
+        let after = tree(["": 25, "a": 100, "a/b": 80, "a/new": 60, "new-name": 401, "same": 7,
+                          "shrinks": 100, "files-only": 20, "empty-new": 0])
+        let base = FolderSnapshot(root: before, path: "/scan", date: earlier)
+        let now = FolderSnapshot(root: after, path: "/scan", date: later, opening: base)
+        c.expect(now.isOpened("") && now.isOpened("a") && !now.isOpened("gone"),
+                 "the current side opens what the earlier scan opened, where it still exists")
+        let comparison = FolderComparison(base: base, current: now)
+        c.equal(comparison.totalChange, after.allocated - before.allocated, "change of the total")
+        c.equal(comparison.changes.map(\.id),
+                ["folder:shrinks", "folder:gone", "folder:a", "folder:a/new", "folder:a/b", "files:", "folder:new-name"],
+                "changes, biggest first")
+        c.equal(comparison.change(at: "a")?.change, 90, "a grew by its subfolders")
+        c.equal(comparison.change(at: "a/new")?.kind, .added, "a new folder")
+        c.equal(comparison.changes.first { $0.path == "gone" }?.kind, .removed, "a removed folder")
+        c.equal(comparison.changes.first { $0.path == "gone" }?.before, 300, "and what it took")
+        c.equal(comparison.change(at: "new-name")?.kind, .renamed, "a renamed folder is recognised")
+        c.equal(comparison.change(at: "new-name")?.oldName, "old-name", "with its earlier name")
+        c.equal(comparison.change(at: "new-name")?.change, 1, "and how much it changed")
+        c.equal(comparison.changes.first { $0.kind == .files }?.change, 15, "loose files in the scanned folder")
+        c.equal(comparison.change(at: "same")?.change, 0, "an unchanged folder is known")
+        c.expect(!comparison.changes.contains { $0.path == "same" || $0.path == "files-only" }, "but not listed")
+        c.equal(comparison.change(at: "empty-new")?.kind, .added, "an empty new folder is known")
+        c.expect(!comparison.changes.contains { $0.path == "empty-new" }, "but not listed (it takes no space)")
+        c.equal(comparison.change(at: "gone"), nil, "nothing to show for a folder that no longer exists")
+        c.equal([comparison.grew, comparison.shrank, comparison.added, comparison.removed, comparison.renamed],
+                [3, 1, 1, 1, 1], "grew, shrank, new, removed, renamed")
+
+        let flatBase = FolderSnapshot(root: tree(["": 10]), path: "/scan", date: earlier)
+        let flat = FolderComparison(base: flatBase, current: FolderSnapshot(root: tree(["": 30]), path: "/scan",
+                                                                            date: later, opening: flatBase))
+        c.equal(flat.changes.map(\.id), ["files:"], "a folder without subfolders lists its loose files")
+
+        let shallowBase = FolderSnapshot(root: before, path: "/scan", date: earlier, maxDepth: 1)
+        let shallowComparison = FolderComparison(
+            base: shallowBase, current: FolderSnapshot(root: after, path: "/scan", date: later, opening: shallowBase))
+        c.equal(shallowComparison.change(at: "a")?.change, 90, "a folder the earlier scan recorded")
+        c.equal(shallowComparison.change(at: "a/new"), nil, "nothing inside a folder the earlier scan didn't open")
+
+        let twins = FolderComparison(
+            base: FolderSnapshot(path: "/scan", date: earlier, allocated: 400,
+                                 children: ["": ["x": 100, "y": 100, "r": 100, "e": 0, "e2": 0]]),
+            current: FolderSnapshot(path: "/scan", date: later, allocated: 450,
+                                    children: ["": ["p": 100, "q": 100, "s": 150, "f": 0]]))
+        c.equal(twins.renamed, 2, "two renamed folders of the same size are both paired")
+        c.equal(twins.removed, 1, "a folder with no match of about its size was removed")
+        c.equal(twins.changes.first { $0.kind == .added }?.path, "s", "and the bigger one is new")
+        c.equal(twins.change(at: "f")?.kind, .added, "empty folders are never taken for renamed ones")
+
+        c.section("Part of an earlier scan")
+        if let part = base.part(at: "/scan/a") {
+            c.equal(part.path, "/scan/a", "path of the part")
+            c.equal(part.allocated, 150, "its total")
+            c.equal(part.children[""], ["b": 50], "its child folders")
+            c.equal(part.partOf, "/scan", "and where it came from")
+        } else {
+            c.fail("no part for an opened folder")
+        }
+        c.equal(base.part(at: "/scan/nope"), nil, "no part for a folder the scan didn't have")
+        c.equal(base.part(at: "/scanner"), nil, "or for a folder outside it")
+        c.equal(FolderSnapshot(path: "/", date: earlier, allocated: 5, children: ["": ["Users": 5], "Users": [:]])
+                    .part(at: "/Users")?.allocated, 5, "a folder inside the root of a disk")
+
+        c.section("Old scan history")
+        let old = #"[{"date":816217450.1,"allocated":1324473909248,"path":"/Users/me","size":1981948116830,"files":6229192}]"#
+        let entries = try? JSONDecoder().decode([HistoryEntry].self, from: Data(old.utf8))
+        c.equal(entries?.first?.allocated, 1_324_473_909_248, "a history file from before snapshots still reads")
+
+        storeTests(c, earlier: earlier)
+        rescanTest(c)
+    }
+
+    static func storeTests(_ c: Checks, earlier: Date) {
+        c.section("Storing snapshots")
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("DiskLensSnapshots-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        var store = SnapshotStore(folder: folder)
+        store.perRoot = 2
+        store.maxRoots = 2
+        func make(_ path: String, _ day: Double, _ size: Int64) -> FolderSnapshot {
+            FolderSnapshot(path: path, date: earlier.addingTimeInterval(day * 86_400), allocated: size,
+                           children: ["": ["a": size], "a": ["b": size]])
+        }
+        let first = make("/scan", 0, 10), second = make("/scan", 1, 20), third = make("/scan", 2, 30)
+        c.equal(store.load() ?? [FolderSnapshot](), [], "no file yet: nothing stored, and nothing to compare with")
+        c.equal(store.record(first), [], "the first scan of a folder has nothing to compare with")
+        c.equal(store.record(second), [first], "the second is compared with the first")
+        c.equal(store.record(third), [second, first], "the third can be compared with either")
+        c.equal(store.load()?.filter { $0.path == "/scan" }.map(\.date).sorted(), [second.date, third.date],
+                "only the last two scans of a folder are kept")
+        c.equal(store.record(make("/other", 3, 5)), [], "another folder isn't compared with /scan")
+
+        let part = store.record(make("/scan/a", 4, 7))
+        c.equal(part.map(\.allocated), [30, 20], "a folder scanned before as part of another is compared with that")
+        c.equal(part.first?.partOf, "/scan", "and says so")
+        c.equal(Set(store.load()?.map(\.path) ?? []), ["/scan/a", "/other"], "only the most recently scanned folders are kept")
+
+        var tiny = store
+        tiny.maxBytes = 10
+        _ = tiny.record(make("/third", 5, 1))
+        c.equal(store.load()?.map(\.path), ["/third"], "when the file gets too big, the folders scanned longest ago go first")
+
+        let url = store.fileURL
+        try? Data("not json".utf8).write(to: url)
+        c.equal(store.record(make("/scan", 6, 1)), [], "a damaged file gives nothing to compare with")
+        c.expect(FileManager.default.fileExists(atPath: folder.appendingPathComponent("snapshots-damaged.json").path),
+                 "and is kept aside")
+        c.equal(store.load()?.count, 1, "a fresh file is started")
+
+        let future = Data(#"{"version":99,"snapshots":[],"more":"from a newer DiskLens"}"#.utf8)
+        try? future.write(to: url)
+        c.equal(store.record(make("/scan", 7, 1)), [], "a file from a newer DiskLens gives nothing to compare with")
+        c.equal(try? Data(contentsOf: url), future, "and is left as it was")
+    }
+
+    /// Scans a folder, changes it, scans it again and compares, the way the app does.
+    static func rescanTest(_ c: Checks) {
+        c.section("Rescanning a changed folder")
+        let fm = FileManager.default
+        let base = fm.temporaryDirectory.appendingPathComponent("DiskLensRescan-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: base) }
+        guard (try? fm.createDirectory(at: base, withIntermediateDirectories: true)) != nil,
+              let real = realpath(base.path, nil) else {
+            c.fail("couldn't make the test folder")
+            return
+        }
+        let root = String(cString: real)
+        free(real)
+        func write(_ relative: String, _ bytes: Int) {
+            let url = URL(fileURLWithPath: root + "/" + relative)
+            try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            fm.createFile(atPath: url.path, contents: Data(repeating: 0x61, count: bytes))
+        }
+        func scan() -> ScanResult? {
+            guard case .finished(let result) = ScanEngine.scan(path: root, displayName: "Rescan", topCount: 10,
+                                                               progress: ScanProgress()) else { return nil }
+            return result
+        }
+        write("top.dat", 10_000)
+        write("keep/a.dat", 100_000)
+        write("grow/g.dat", 50_000)
+        write("shrink/s1.dat", 200_000)
+        write("shrink/s2.dat", 200_000)
+        write("remove/r.dat", 300_000)
+        write("rename-me/n.dat", 150_000)
+        write("deep/er/still.dat", 20_000)
+        guard let first = scan() else {
+            c.fail("the first scan didn't finish")
+            return
+        }
+        let earlier = FolderSnapshot(root: first.root, path: root, date: first.started)
+
+        write("grow/more.dat", 400_000)
+        try? fm.removeItem(atPath: root + "/shrink/s2.dat")
+        try? fm.removeItem(atPath: root + "/remove")
+        try? fm.moveItem(atPath: root + "/rename-me", toPath: root + "/renamed")
+        write("fresh/f.dat", 250_000)
+        write("top2.dat", 30_000)
+        write("deep/er/new/n.dat", 40_000)
+        guard let second = scan() else {
+            c.fail("the second scan didn't finish")
+            return
+        }
+        let comparison = FolderComparison(
+            base: earlier, current: FolderSnapshot(root: second.root, path: root, date: second.started, opening: earlier))
+        let node = { (relative: String) in second.root.descendant(atPath: root + "/" + relative) }
+        let oldNode = { (relative: String) in first.root.descendant(atPath: root + "/" + relative) }
+
+        c.equal(comparison.totalChange, second.root.allocated - first.root.allocated, "total change")
+        c.equal(comparison.change(at: "grow")?.after, node("grow")?.allocated, "grow: size now")
+        c.equal(comparison.change(at: "grow")?.before, oldNode("grow")?.allocated, "grow: size before")
+        c.expect((comparison.change(at: "grow")?.change ?? 0) >= 400_000, "grow grew by the new file")
+        c.expect((comparison.change(at: "shrink")?.change ?? 0) <= -200_000, "shrink shrank by the removed file")
+        c.equal(comparison.change(at: "keep")?.change, 0, "keep didn't change")
+        c.equal(comparison.change(at: "fresh")?.kind, .added, "fresh is new")
+        c.equal(comparison.change(at: "renamed")?.kind, .renamed, "rename-me was renamed")
+        c.equal(comparison.change(at: "renamed")?.oldName, "rename-me", "from rename-me")
+        let removed = comparison.changes.first { $0.path == "remove" }
+        c.equal(removed?.kind, .removed, "remove was removed")
+        c.equal(removed?.before, oldNode("remove")?.allocated, "with the space it took")
+        c.equal(comparison.change(at: "deep/er/new")?.kind, .added, "a new folder deeper down")
+        c.expect((comparison.changes.first { $0.kind == .files && $0.path == "" }?.change ?? 0) >= 30_000,
+                 "new loose files in the scanned folder")
+        c.expect(!comparison.changes.contains { $0.path == "keep" }, "unchanged folders aren't listed")
+        c.equal(comparison.changes.first?.path, "grow", "the biggest change comes first")
+
+        // What AppModel does after a folder is moved to the Trash: compare the changed tree again.
+        if let grow = node("grow") {
+            second.root.removeChild(grow)
+            let afterTrash = FolderComparison(
+                base: earlier, current: FolderSnapshot(root: second.root, path: root, date: second.started, opening: earlier))
+            c.equal(afterTrash.changes.first { $0.path == "grow" }?.kind, .removed, "a folder moved to the Trash shows as removed")
+            c.equal(afterTrash.totalChange, second.root.allocated - first.root.allocated, "and the total follows")
+        }
+    }
+
+    // MARK: - Suggestions
+
+    /// Finds well-known places in made-up trees (no files needed: suggestions come from the tree).
+    @MainActor
+    static func suggestionTests(_ c: Checks) {
+        let mb: Int64 = 1_000_000
+        let home = "/Users/test"
+        let homeFolders: [(String, Int64)] = [
+            ("Library/Developer/Xcode/DerivedData/App-abc/Build", 900 * mb),
+            ("Library/Developer/Xcode/Archives/2026-01-01", 300 * mb),
+            ("Library/Developer/Xcode/iOS DeviceSupport/18.0", 200 * mb),
+            ("Library/Developer/CoreSimulator/Devices/UUID-1", 700 * mb),
+            ("Library/Caches/com.example.app", 100 * mb),
+            ("Library/Caches/Homebrew/downloads", 400 * mb),
+            ("Library/Application Support/MobileSync/Backup/device-1", 800 * mb),
+            ("Library/Containers/com.docker.docker/Data", 1_000 * mb),
+            (".Trash/old-project/node_modules", 50 * mb),
+            ("Projects/web/node_modules/react", 120 * mb),
+            ("Projects/web/node_modules/react/node_modules/inner", 30 * mb),   // part of the outer one
+            ("Projects/web/src", 1 * mb),
+            ("Projects/mono/packages/ui/node_modules/x", 60 * mb),
+            ("Projects/empty/node_modules", 0),                                  // nothing to free
+            (".vscode/extensions/ext/node_modules/x", 70 * mb),                  // an editor extension
+            ("Library/Application Support/Code/node_modules/x", 80 * mb),        // app data
+            ("Applications/Tool.app/Contents/Resources/app/node_modules/x", 90 * mb),  // inside an app
+            ("Documents/notes", 5 * mb),
+        ]
+        let homeScan = SuggestionTree.make(rootPath: home, folders: homeFolders)
+        let found = Suggestions.find(in: homeScan, home: home)
+        let byKind = Dictionary(found.map { ($0.kind, $0) }, uniquingKeysWith: { first, _ in first })
+
+        c.section("Suggestions: a home folder scan")
+        c.equal(Set(found.map(\.kind)), Set(Suggestions.Kind.allCases), "finds every kind of place")
+        c.equal(found.map(\.allocated), found.map(\.allocated).sorted(by: >), "largest first")
+        c.equal(found.first?.kind, .docker, "the largest is Docker's data")
+        c.equal(byKind[.derivedData]?.nodes.first?.path, home + "/Library/Developer/Xcode/DerivedData", "DerivedData's path")
+        c.equal(byKind[.derivedData]?.allocated, 900 * mb, "DerivedData's size")
+        c.equal(byKind[.caches]?.allocated, 500 * mb, "Caches includes Homebrew's cache")
+        c.equal(byKind[.homebrew]?.allocated, 400 * mb, "Homebrew's cache on its own")
+        c.equal(byKind[.trash]?.allocated, 50 * mb, "the Trash")
+        c.expect(byKind[.trash]?.kind.canTrash == false, "the Trash itself is never moved to the Trash")
+        let packages = byKind[.nodeModules]
+        c.equal(packages?.nodes.map(\.path), [home + "/Projects/web/node_modules", home + "/Projects/mono/packages/ui/node_modules"],
+                "node_modules of projects only, outer ones only, largest first")
+        c.equal(packages?.allocated, 210 * mb, "node_modules total")
+        c.equal(Suggestions.total(of: found),
+                (900 + 300 + 200 + 700 + 500 + 800 + 1_000 + 50 + 210) * mb, "the total counts Homebrew's cache once")
+        for suggestion in found where suggestion.kind.canTrash {
+            for node in suggestion.nodes {
+                c.expect(node.parent != nil, "\(suggestion.kind) is below the scan's top folder")
+            }
+        }
+        for kind in Suggestions.Kind.allCases where kind.canTrash {
+            if let relative = kind.homePath {
+                c.expect(!FileActions.isProtected(NSHomeDirectory() + "/" + relative), "\(kind) can be moved to the Trash")
+            }
+        }
+
+        c.section("Suggestions: other scans")
+        let disk = SuggestionTree.make(rootPath: "/System/Volumes/Data", folders: [
+            ("Users/test/Library/Caches/x", 100 * mb),
+            ("Users/test/code/site/node_modules/x", 20 * mb),
+            ("Users/other/Library/Caches/x", 300 * mb),                          // another user's
+            ("usr/local/lib/node_modules/npm", 40 * mb),                         // global packages
+            ("opt/homebrew/lib/node_modules/x", 40 * mb),
+            ("Applications/Big.app/Contents/node_modules/x", 40 * mb),
+            ("private/var/folders/node_modules/x", 40 * mb),
+        ])
+        let diskFound = Suggestions.find(in: disk, home: home)
+        c.equal(diskFound.map(\.kind), [.caches, .nodeModules], "startup disk: the user's caches and project packages")
+        c.equal(diskFound.first?.nodes.first?.path, "/System/Volumes/Data/Users/test/Library/Caches",
+                "startup disk: found inside the data volume")
+        c.equal(diskFound.last?.nodes.map(\.path), ["/System/Volumes/Data/Users/test/code/site/node_modules"],
+                "startup disk: no node_modules of apps or command-line tools")
+
+        let library = SuggestionTree.make(rootPath: home + "/Library/Developer", folders: [
+            ("Xcode/DerivedData/x", 10 * mb), ("CoreSimulator/Devices/x", 10 * mb),
+        ])
+        c.equal(Set(Suggestions.find(in: library, home: home).map(\.kind)), [.derivedData, .simulators],
+                "a scan of ~/Library/Developer finds Xcode's folders only")
+        let caches = SuggestionTree.make(rootPath: home + "/Library/Caches", folders: [("Homebrew/x", 10 * mb), ("y", 5 * mb)])
+        c.equal(Suggestions.find(in: caches, home: home).map(\.kind), [.homebrew],
+                "a scan of ~/Library/Caches suggests what's inside it, not the scan itself")
+        let emptyTrash = SuggestionTree.make(rootPath: home, folders: [(".Trash", 0), ("Documents/a", 5 * mb)])
+        c.expect(Suggestions.find(in: emptyTrash, home: home).isEmpty, "an empty Trash isn't suggested")
+        let elsewhere = SuggestionTree.make(rootPath: "/Volumes/Work", folders: [("Library/Caches/x", 10 * mb), ("app/node_modules/x", 10 * mb)])
+        c.equal(Suggestions.find(in: elsewhere, home: home).map(\.kind), [.nodeModules], "another disk: node_modules only")
+        let extensions = SuggestionTree.make(rootPath: home + "/.vscode/extensions", folders: [("ext/node_modules/x", 10 * mb)])
+        c.expect(Suggestions.nodeModules(in: extensions).isEmpty, "a scan inside a hidden tool folder suggests no node_modules")
+
+        c.equal(Suggestions.candidatePaths("/Users/test/.Trash"), ["/Users/test/.Trash", "/System/Volumes/Data/Users/test/.Trash"],
+                "a path, and the same path on the data volume")
+        for path in ["/usr/local/lib", "/System/Volumes/Data/opt/homebrew", "/Applications/A.app/Contents", "/Users/test/Library/X",
+                     "/Users/test/.nvm/versions", "/Library"] {
+            c.expect(Suggestions.isToolPath(path), "\(path) holds tools, not projects")
+        }
+        for path in ["/", "/System/Volumes/Data", "/System/Volumes/Data/Users/test", "/Users/test/Projects", "/Volumes/Work/code"] {
+            c.expect(!Suggestions.isToolPath(path), "\(path) can hold projects")
+        }
     }
 
     // MARK: - The test folder
@@ -412,6 +787,37 @@ final class Checks {
 
     func equal<T: Equatable>(_ actual: T, _ expected: T, _ what: String, line: UInt = #line) {
         expect(actual == expected, "\(what): got \(actual), expected \(expected)", line: line)
+    }
+}
+
+/// Builds a scan tree in memory: each folder path (relative to the root) gets the given space in
+/// its own files, and every folder on the way is created.
+enum SuggestionTree {
+    static func make(rootPath: String, folders: [(String, Int64)]) -> Node {
+        let root = Node(name: (rootPath as NSString).lastPathComponent, parent: nil)
+        root.rootPath = rootPath
+        for (relative, allocated) in folders {
+            var node = root
+            for name in relative.split(separator: "/").map(String.init) {
+                if let existing = node.children.first(where: { $0.name == name }) {
+                    node = existing
+                } else {
+                    let child = Node(name: name, parent: node)
+                    node.children.append(child)
+                    node = child
+                }
+            }
+            node.ownAllocated += allocated
+            node.ownSize += allocated
+            node.ownFileCount += allocated > 0 ? 1 : 0
+        }
+        finalize(root)
+        return root
+    }
+
+    private static func finalize(_ node: Node) {
+        for child in node.children { finalize(child) }
+        node.finalize()
     }
 }
 

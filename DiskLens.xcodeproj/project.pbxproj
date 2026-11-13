@@ -13,6 +13,7 @@
 		82FDB5029E6F8623BBAF7240 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB3E48D4B9BABC5FB05CF463 /* ContentView.swift */; };
 		3C71317426F36E667881AD4B /* DetailsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C23D9F5E0E43A6D75198CAB /* DetailsView.swift */; };
 		546F4837DBB2CB3A1CF525A1 /* DiskLensApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FE63A6378702FDB2A4F67F5 /* DiskLensApp.swift */; };
+		DE5C56B5D9CF70A28FDDB597 /* FolderChanges.swift in Sources */ = {isa = PBXBuildFile; fileRef = 01A6A0FE0C1D1B72EE876923 /* FolderChanges.swift */; };
 		252DFFAC1BC32C9651A76A60 /* Navigation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 862F343CCAEC3ABDA503F7A5 /* Navigation.swift */; };
 		C354738574951CAC908D0362 /* Node.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AD2381595131FE14587F267 /* Node.swift */; };
 		B656C372FB6283924393C74F /* ScanEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = C280CC58040C85EC567ADFF5 /* ScanEngine.swift */; };
@@ -21,6 +22,7 @@
 		5229C8C3201B440745517CFB /* Settings.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE7EB1C8E2A398E1D57F67D2 /* Settings.swift */; };
 		85D3D904B3E4CF11EF0A3042 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F02F5F5C6A33AB2D897E3A9F /* SettingsView.swift */; };
 		C13D9960A709521B9A68A1BF /* Support.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D8F1C62D18DC5F940075FC8 /* Support.swift */; };
+		04E8DB7681FD3B6912027F47 /* Suggestions.swift in Sources */ = {isa = PBXBuildFile; fileRef = B41F3CD7485B5C5FB0D1BBFD /* Suggestions.swift */; };
 		D2B2CE25B487C834A0044F51 /* TreeOutline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6960D47E51ACCBE33A0D9BDD /* TreeOutline.swift */; };
 		4BB0AA373810A82FF89CEB68 /* TreemapView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1954F2C7ABF4CFA3CBB8C567 /* TreemapView.swift */; };
 		A1D3E5F7092B4C6D8E0F1A2B /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2E4F6081A3C5D7E9F0A1B2C /* Theme.swift */; };
@@ -37,6 +39,7 @@
 		CB3E48D4B9BABC5FB05CF463 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		1C23D9F5E0E43A6D75198CAB /* DetailsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DetailsView.swift; sourceTree = "<group>"; };
 		6FE63A6378702FDB2A4F67F5 /* DiskLensApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiskLensApp.swift; sourceTree = "<group>"; };
+		01A6A0FE0C1D1B72EE876923 /* FolderChanges.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FolderChanges.swift; sourceTree = "<group>"; };
 		862F343CCAEC3ABDA503F7A5 /* Navigation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Navigation.swift; sourceTree = "<group>"; };
 		5AD2381595131FE14587F267 /* Node.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Node.swift; sourceTree = "<group>"; };
 		C280CC58040C85EC567ADFF5 /* ScanEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanEngine.swift; sourceTree = "<group>"; };
@@ -45,6 +48,7 @@
 		BE7EB1C8E2A398E1D57F67D2 /* Settings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Settings.swift; sourceTree = "<group>"; };
 		F02F5F5C6A33AB2D897E3A9F /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		0D8F1C62D18DC5F940075FC8 /* Support.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Support.swift; sourceTree = "<group>"; };
+		B41F3CD7485B5C5FB0D1BBFD /* Suggestions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Suggestions.swift; sourceTree = "<group>"; };
 		6960D47E51ACCBE33A0D9BDD /* TreeOutline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TreeOutline.swift; sourceTree = "<group>"; };
 		1954F2C7ABF4CFA3CBB8C567 /* TreemapView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TreemapView.swift; sourceTree = "<group>"; };
 		B2E4F6081A3C5D7E9F0A1B2C /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
@@ -89,6 +93,7 @@
 				CB3E48D4B9BABC5FB05CF463 /* ContentView.swift */,
 				1C23D9F5E0E43A6D75198CAB /* DetailsView.swift */,
 				6FE63A6378702FDB2A4F67F5 /* DiskLensApp.swift */,
+				01A6A0FE0C1D1B72EE876923 /* FolderChanges.swift */,
 				862F343CCAEC3ABDA503F7A5 /* Navigation.swift */,
 				5AD2381595131FE14587F267 /* Node.swift */,
 				C280CC58040C85EC567ADFF5 /* ScanEngine.swift */,
@@ -97,6 +102,7 @@
 				BE7EB1C8E2A398E1D57F67D2 /* Settings.swift */,
 				F02F5F5C6A33AB2D897E3A9F /* SettingsView.swift */,
 				0D8F1C62D18DC5F940075FC8 /* Support.swift */,
+				B41F3CD7485B5C5FB0D1BBFD /* Suggestions.swift */,
 				6960D47E51ACCBE33A0D9BDD /* TreeOutline.swift */,
 				1954F2C7ABF4CFA3CBB8C567 /* TreemapView.swift */,
 				B2E4F6081A3C5D7E9F0A1B2C /* Theme.swift */,
@@ -182,6 +188,7 @@
 				82FDB5029E6F8623BBAF7240 /* ContentView.swift in Sources */,
 				3C71317426F36E667881AD4B /* DetailsView.swift in Sources */,
 				546F4837DBB2CB3A1CF525A1 /* DiskLensApp.swift in Sources */,
+				DE5C56B5D9CF70A28FDDB597 /* FolderChanges.swift in Sources */,
 				252DFFAC1BC32C9651A76A60 /* Navigation.swift in Sources */,
 				C354738574951CAC908D0362 /* Node.swift in Sources */,
 				B656C372FB6283924393C74F /* ScanEngine.swift in Sources */,
@@ -190,6 +197,7 @@
 				5229C8C3201B440745517CFB /* Settings.swift in Sources */,
 				85D3D904B3E4CF11EF0A3042 /* SettingsView.swift in Sources */,
 				C13D9960A709521B9A68A1BF /* Support.swift in Sources */,
+				04E8DB7681FD3B6912027F47 /* Suggestions.swift in Sources */,
 				D2B2CE25B487C834A0044F51 /* TreeOutline.swift in Sources */,
 				4BB0AA373810A82FF89CEB68 /* TreemapView.swift in Sources */,
 				A1D3E5F7092B4C6D8E0F1A2B /* Theme.swift in Sources */,

@@ -23,6 +23,15 @@ final class AppModel: ObservableObject {
     /// Bumped whenever the tree changes after a scan (for example after moving something to the Trash).
     @Published private(set) var version = 0
     @Published private(set) var history: [HistoryEntry] = []
+    /// Earlier scans the current one can be compared with, newest first (see `SnapshotStore.record`).
+    /// nil while they're being read, just after a scan.
+    @Published private(set) var comparisonBases: [FolderSnapshot]?
+    /// Which of `comparisonBases` the changes are measured against.
+    @Published var comparisonIndex = 0 {
+        didSet { refreshChanges() }
+    }
+    /// Which folders grew or shrank since that earlier scan. nil when there's nothing to compare with.
+    @Published private(set) var changes: FolderComparison?
     /// The latest scan of each folder scanned before, newest first (shown before the first scan).
     @Published private(set) var recentScans: [HistoryEntry] = HistoryStore.recent()
     @Published private(set) var backStack: [Node] = []
@@ -50,6 +59,7 @@ final class AppModel: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private var scanActivity: NSObjectProtocol?
     private var mouseMonitor: Any?
+    private var snapshotTask: Task<Void, Never>?
     private static let historyLimit = 500
 
     struct Target: Identifiable {
@@ -181,6 +191,40 @@ final class AppModel: ObservableObject {
                                          size: root.size, allocated: root.allocated, files: root.fileCount))
         history = HistoryStore.entries(for: newResult.rootPath)
         recentScans = HistoryStore.recent()
+        recordSnapshot(of: newResult)
+    }
+
+    // MARK: - Changes since an earlier scan
+
+    /// Saves the sizes of the scan's biggest folders, then compares the scan with the earlier ones.
+    /// The snapshot is taken here (the tree belongs to the main thread); the file is read and
+    /// written in the background.
+    private func recordSnapshot(of scan: ScanResult) {
+        let snapshot = FolderSnapshot(root: scan.root, path: scan.rootPath, date: scan.started)
+        comparisonBases = nil
+        changes = nil
+        snapshotTask?.cancel()
+        snapshotTask = Task { @MainActor [weak self] in
+            let bases = await Task.detached(priority: .utility) {
+                SnapshotStore.standard.record(snapshot)
+            }.value
+            guard let self, self.result === scan else { return }
+            self.comparisonBases = bases
+            self.comparisonIndex = 0   // compares (didSet)
+        }
+    }
+
+    /// Compares the current tree with the chosen earlier scan. Cheap: it only looks at the folders
+    /// that scan recorded. Called after every change to the tree, so moving things to the Trash
+    /// shows up here too.
+    private func refreshChanges() {
+        guard let scan = result, let bases = comparisonBases, bases.indices.contains(comparisonIndex) else {
+            changes = nil
+            return
+        }
+        let base = bases[comparisonIndex]
+        let now = FolderSnapshot(root: scan.root, path: scan.rootPath, date: scan.started, opening: base)
+        changes = FolderComparison(base: base, current: now)
     }
 
     /// The folder to scan for a path the user picked, and the name to show for it.
@@ -329,6 +373,7 @@ final class AppModel: ObservableObject {
             scan.topFiles.removeAll { $0.path.hasPrefix(path + "/") }
             scan.remove(tally)
             scan.hardLinkDuplicates = max(0, scan.hardLinkDuplicates - node.uncountedLinksBelow)
+            refreshChanges()
             version += 1
         }
     }
@@ -366,6 +411,7 @@ final class AppModel: ObservableObject {
             }
         }
         result?.topFiles.removeAll { $0.path == path }
+        refreshChanges()
         version += 1
     }
 
