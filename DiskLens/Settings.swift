@@ -16,6 +16,16 @@ enum SizeMode: String, CaseIterable, Identifiable {
         }
     }
 
+    /// For the narrow switch above the folder tree.
+    var shortTitle: String {
+        switch self {
+        case .allocated: return "On Disk"
+        case .size: return "Size"
+        case .files: return "Files"
+        case .percent: return "%"
+        }
+    }
+
     var help: String {
         switch self {
         case .allocated: return "Space actually used on disk (like Finder's “on disk”)"

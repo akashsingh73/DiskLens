@@ -1,12 +1,10 @@
 import SwiftUI
 
-/// The bar across the top of the window: scanning, Back / Forward / Up, how sizes are shown, and search.
+/// The bar across the top of the window: scanning, Back / Forward / Up, and search.
 /// It is ordinary window content rather than a SwiftUI toolbar: toolbar items that change size
 /// can send SwiftUI and AppKit into an endless layout loop, which is what crashed version 1.0.
 struct CommandBar: View {
     @ObservedObject var model: AppModel
-    @AppStorage(Prefs.sizeMode) private var mode: SizeMode = .allocated
-    @AppStorage(Prefs.unit) private var unit: SizeUnit = .auto
 
     var body: some View {
         HStack(spacing: 8) {
@@ -69,26 +67,6 @@ struct CommandBar: View {
 
             Spacer(minLength: 12)
 
-            Picker("Show", selection: $mode) {
-                ForEach(SizeMode.allCases) { option in
-                    Text(option.title).tag(option)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .fixedSize()
-            .help("What the sizes and bars show")
-
-            Picker("Unit", selection: $unit) {
-                ForEach(SizeUnit.allCases) { option in
-                    Text(option.title).tag(option)
-                }
-            }
-            .pickerStyle(.menu)
-            .labelsHidden()
-            .fixedSize()
-            .help("Size unit")
-
             SearchButton(model: model, search: model.search)
         }
         .padding(.horizontal, 10)
@@ -107,6 +85,108 @@ struct CommandBar: View {
         }
         .disabled(!enabled)
         .help(help)
+    }
+}
+
+/// The row just above the folder tree: what the sizes and bars show (On Disk, Size, Files or % of
+/// the parent folder) and the unit. It sits next to the tree because the tree is what it changes
+/// most; the views on the right follow it too.
+struct SizeModeBar: View {
+    @AppStorage(Prefs.sizeMode) private var mode: SizeMode = .allocated
+    @AppStorage(Prefs.unit) private var unit: SizeUnit = .auto
+
+    var body: some View {
+        // The widest layout that fits the sidebar; the last one fits even the narrowest sidebar.
+        ViewThatFits(in: .horizontal) {
+            row(unitTitle: true)
+            row(unitTitle: false)
+            compactRow
+        }
+        .padding(.horizontal, 8)
+        .padding(.top, 2)
+        .padding(.bottom, 8)
+    }
+
+    /// Both choices as small menus, for a very narrow sidebar.
+    private var compactRow: some View {
+        HStack(spacing: 8) {
+            Picker("Show", selection: $mode) {
+                ForEach(SizeMode.allCases) { option in
+                    Text(option.title).tag(option)
+                }
+            }
+            .pickerStyle(.menu)
+            .fixedSize()
+            .help("Sizes and bars show: \(mode.help)")
+            Spacer(minLength: 0)
+            unitMenu(showTitle: false)
+        }
+        .controlSize(.small)
+    }
+
+    private func unitMenu(showTitle: Bool) -> some View {
+        Menu {
+            Picker("Unit", selection: $unit) {
+                ForEach(SizeUnit.allCases) { option in
+                    Text(option.title).tag(option)
+                }
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+        } label: {
+            if showTitle {
+                Label(unit.title, systemImage: "ruler")
+            } else {
+                Label(unit.title, systemImage: "ruler").labelStyle(.iconOnly)
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Size unit: \(unit.title)")
+    }
+
+    private func row(unitTitle: Bool) -> some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 2) {
+                ForEach(SizeMode.allCases) { option in
+                    ModeSegment(option: option, selected: mode == option) { mode = option }
+                }
+            }
+            .padding(2)
+            .background(Capsule().fill(Color.primary.opacity(0.07)))
+            .fixedSize()
+
+            Spacer(minLength: 0)
+
+            unitMenu(showTitle: unitTitle)
+        }
+        .controlSize(.small)
+    }
+}
+
+/// One choice in the size-mode switch: a pill that fills with the accent colour when chosen.
+private struct ModeSegment: View {
+    let option: SizeMode
+    let selected: Bool
+    let action: @MainActor () -> Void
+    @StateObject private var hover = HoverState()
+
+    var body: some View {
+        Button(action: action) {
+            Text(option.shortTitle)
+                .font(.system(size: 12, weight: selected ? .semibold : .regular))
+                .foregroundStyle(selected ? Color.white : Color.primary.opacity(0.8))
+                .padding(.horizontal, 9)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(selected ? Color.accentColor
+                                                    : Color.primary.opacity(hover.isHovering ? 0.07 : 0)))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .onHover { hover.isHovering = $0 }
+        .help("\(option.title): \(option.help)")
+        .accessibilityLabel(option.title)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 

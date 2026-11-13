@@ -64,8 +64,10 @@ ad-hoc signature, so use `build.sh` for the copy you keep in Applications.
 - **Summary card**: the scan's total, how much of the disk it takes, and file and folder counts.
 - **Folder tree** with a size bar on every row (scaled to the whole scan, or to the parent folder), bold for big
   folders, a `[Files]` entry for each folder's loose files, and an option to hide small items.
-- **Size modes**: On Disk (space really used), Size, file count, or % of parent; units auto, B, KB, MB, GB, TB;
-  decimal (like Finder) or binary units.
+- **Size modes**: a switch right above the tree shows On Disk (space really used), Size, file count, or % of
+  parent, with a unit menu beside it (auto, B, KB, MB, GB, TB); decimal (like Finder) or binary units in Settings.
+- **Layout**: the folder tree takes about a quarter of the window and the views the rest. Drag the divider to
+  change it; DiskLens remembers where you leave it, and resizing the window widens the views, not the tree.
 - **Details**: a sortable list with columns you can hide (right-click the header): On Disk, % of Parent, Size,
   Files, Folders, Modified, Kind.
 - **Treemap**: each top-level folder has its own colour and a labelled title strip; deeper folders get lighter
@@ -105,7 +107,9 @@ ad-hoc signature, so use `build.sh` for the copy you keep in Applications.
 | Find a folder or file by name | ⌘F (or click Search at the top right), type part of the name, then ↑↓ and Return to go there |
 | Switch views | ⌘1 Details, ⌘2 Treemap, ⌘3 Chart, ⌘4 File Types, ⌘5 Top Files, ⌘6 Ages, ⌘7 History, ⌘8 Suggestions |
 | Preview a file | Select it in Details and press Space |
-| Change units, bar colours, treemap detail | DiskLens ▸ Settings (⌘,) |
+| Show sizes, file counts or % of parent | The On Disk / Size / Files / % switch above the folder tree, with the unit menu beside it |
+| Make the tree wider or narrower | Drag the divider between the tree and the views |
+| Change bar colours, unit system, treemap detail | DiskLens ▸ Settings (⌘,) |
 
 ## How sizes are counted
 

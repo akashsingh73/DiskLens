@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 enum DetailTab: String, CaseIterable, Identifiable {
     case details = "Details"
@@ -42,7 +43,8 @@ enum DetailTab: String, CaseIterable, Identifiable {
 /// The main window: the command bar on top, the folder tree on the left, the views on the right.
 ///
 /// The window deliberately has no SwiftUI toolbar and no NavigationSplitView (which always adds
-/// one): version 1.0 crashed in a toolbar layout loop. A plain split view has no toolbar to loop.
+/// one): version 1.0 crashed in a toolbar layout loop. The two panes sit in a plain AppKit split
+/// view instead (`MainSplitView`), which has no toolbar to loop.
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
     private var prefs = DisplayPrefs()
@@ -53,19 +55,20 @@ struct ContentView: View {
         VStack(spacing: 0) {
             CommandBar(model: model)
             Divider()
-            HSplitView {
-                sidebar(settings)
-                    .frame(minWidth: 270, idealWidth: 380, maxWidth: 760, maxHeight: .infinity)
-                detail(settings)
-                    .frame(minWidth: 560, maxWidth: .infinity, maxHeight: .infinity)
-            }
+            MainSplitView(
+                sidebar: sidebar(settings)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .modifier(ScanDropTarget(model: model))
+                    .environmentObject(model),
+                detail: detail(settings)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .modifier(ScanDropTarget(model: model))
+                    .environmentObject(model)
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .navigationTitle(model.result?.displayName ?? "DiskLens")
-        .dropDestination(for: URL.self) { urls, _ in
-            guard let url = urls.first, !model.isScanning else { return false }
-            model.scan(path: url.path)
-            return true
-        }
+        .modifier(ScanDropTarget(model: model))
         .alert("Couldn't scan", isPresented: $model.showingError) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -100,6 +103,7 @@ struct ContentView: View {
                 .padding(10)
             }
             if scanned != nil {
+                SizeModeBar()
                 Divider()
                 TreeOutline(model: model, settings: settings)
             } else {
@@ -153,6 +157,107 @@ struct ContentView: View {
         } else {
             WelcomePanel(model: model)
         }
+    }
+}
+
+// MARK: - Split view
+
+/// Dropping a folder anywhere on the window scans it.
+struct ScanDropTarget: ViewModifier {
+    @ObservedObject var model: AppModel
+
+    func body(content: Content) -> some View {
+        content.dropDestination(for: URL.self) { urls, _ in
+            guard let url = urls.first, !model.isScanning else { return false }
+            model.scan(path: url.path)
+            return true
+        }
+    }
+}
+
+/// The sidebar and the views beside it, in an AppKit split view. On first launch the sidebar
+/// takes about a quarter of the window; after that the divider stays where the user leaves it
+/// (macOS saves it), and resizing the window widens or narrows the right side only.
+///
+/// The panes are hosted without size constraints from their SwiftUI content, so the split view
+/// alone decides their sizes and nothing can feed a measured size back into layout.
+struct MainSplitView<Sidebar: View, Detail: View>: NSViewControllerRepresentable {
+    let sidebar: Sidebar
+    let detail: Detail
+
+    func makeNSViewController(context: Context) -> MainSplitController<Sidebar, Detail> {
+        MainSplitController(sidebar: sidebar, detail: detail)
+    }
+
+    func updateNSViewController(_ controller: MainSplitController<Sidebar, Detail>, context: Context) {
+        controller.show(sidebar: sidebar, detail: detail)
+    }
+}
+
+final class MainSplitController<Sidebar: View, Detail: View>: NSSplitViewController {
+    /// The share of the window the sidebar gets until the user moves the divider, and the
+    /// narrowest it starts at (so its controls fit on small windows).
+    static var defaultSidebarShare: CGFloat { 0.26 }
+    static var defaultSidebarMinimum: CGFloat { 310 }
+    static var sidebarMinimum: CGFloat { 270 }
+    static var sidebarMaximum: CGFloat { 760 }
+    static var detailMinimum: CGFloat { 560 }
+    private static var autosaveName: String { "DiskLens.MainSplit" }
+
+    private let sidebarHost: NSHostingController<Sidebar>
+    private let detailHost: NSHostingController<Detail>
+    private var placedDivider = false
+
+    init(sidebar: Sidebar, detail: Detail) {
+        sidebarHost = NSHostingController(rootView: sidebar)
+        detailHost = NSHostingController(rootView: detail)
+        sidebarHost.sizingOptions = []
+        detailHost.sizingOptions = []
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("MainSplitController is created in code")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
+
+        let sidebarItem = NSSplitViewItem(viewController: sidebarHost)
+        sidebarItem.minimumThickness = Self.sidebarMinimum
+        sidebarItem.maximumThickness = Self.sidebarMaximum
+        sidebarItem.canCollapse = false
+        // The higher priority keeps the sidebar's width when the window is resized.
+        sidebarItem.holdingPriority = NSLayoutConstraint.Priority(260)
+
+        let detailItem = NSSplitViewItem(viewController: detailHost)
+        detailItem.minimumThickness = Self.detailMinimum
+        detailItem.holdingPriority = NSLayoutConstraint.Priority(250)
+
+        addSplitViewItem(sidebarItem)
+        addSplitViewItem(detailItem)
+        splitView.autosaveName = Self.autosaveName
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        guard !placedDivider else { return }
+        placedDivider = true
+        // Only the first time: after that macOS restores where the user left the divider.
+        let saved = UserDefaults.standard.object(forKey: "NSSplitView Subview Frames \(Self.autosaveName)") != nil
+        guard !saved else { return }
+        let width = splitView.bounds.width
+        guard width > 0 else { return }
+        let sidebarWidth = min(max((width * Self.defaultSidebarShare).rounded(), Self.defaultSidebarMinimum),
+                               max(Self.sidebarMinimum, width - Self.detailMinimum))
+        splitView.setPosition(sidebarWidth, ofDividerAt: 0)
+    }
+
+    func show(sidebar: Sidebar, detail: Detail) {
+        sidebarHost.rootView = sidebar
+        detailHost.rootView = detail
     }
 }
 
