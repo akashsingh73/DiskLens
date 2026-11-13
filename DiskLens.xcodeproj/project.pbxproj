@@ -1,0 +1,314 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		8C42622FBEADB60CD341F7ED /* AnalysisViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6FAF301F2935475D436E970 /* AnalysisViews.swift */; };
+		C42B122F4C5426FC64DC48E1 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD23BF1A6021A99C05661810 /* AppModel.swift */; };
+		B47F40942A9B8541B4A95F18 /* ChartsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7CF1505EC3DE82A8CB3DCF0 /* ChartsView.swift */; };
+		82FDB5029E6F8623BBAF7240 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB3E48D4B9BABC5FB05CF463 /* ContentView.swift */; };
+		3C71317426F36E667881AD4B /* DetailsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C23D9F5E0E43A6D75198CAB /* DetailsView.swift */; };
+		546F4837DBB2CB3A1CF525A1 /* DiskLensApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FE63A6378702FDB2A4F67F5 /* DiskLensApp.swift */; };
+		252DFFAC1BC32C9651A76A60 /* Navigation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 862F343CCAEC3ABDA503F7A5 /* Navigation.swift */; };
+		C354738574951CAC908D0362 /* Node.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AD2381595131FE14587F267 /* Node.swift */; };
+		B656C372FB6283924393C74F /* ScanEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = C280CC58040C85EC567ADFF5 /* ScanEngine.swift */; };
+		EB6B6E38BC7FCDECCF234029 /* ScanTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4770739878DAAC382C85A74 /* ScanTypes.swift */; };
+		39C1A714370B2F16EB5A5080 /* Scanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 847ECA1A8B87CFC14D803B9E /* Scanner.swift */; };
+		5229C8C3201B440745517CFB /* Settings.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE7EB1C8E2A398E1D57F67D2 /* Settings.swift */; };
+		85D3D904B3E4CF11EF0A3042 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F02F5F5C6A33AB2D897E3A9F /* SettingsView.swift */; };
+		C13D9960A709521B9A68A1BF /* Support.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D8F1C62D18DC5F940075FC8 /* Support.swift */; };
+		D2B2CE25B487C834A0044F51 /* TreeOutline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6960D47E51ACCBE33A0D9BDD /* TreeOutline.swift */; };
+		4BB0AA373810A82FF89CEB68 /* TreemapView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1954F2C7ABF4CFA3CBB8C567 /* TreemapView.swift */; };
+		A1D3E5F7092B4C6D8E0F1A2B /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2E4F6081A3C5D7E9F0A1B2C /* Theme.swift */; };
+		C3F5071928AB4D6E8F0A1B2D /* AppIcon.icns in Resources */ = {isa = PBXBuildFile; fileRef = D4061829B3AC5E7F9A0B1C2E /* AppIcon.icns */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		F5BF48AA40CAD7891EB709FC /* DiskLens.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DiskLens.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F6FAF301F2935475D436E970 /* AnalysisViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnalysisViews.swift; sourceTree = "<group>"; };
+		AD23BF1A6021A99C05661810 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		A7CF1505EC3DE82A8CB3DCF0 /* ChartsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChartsView.swift; sourceTree = "<group>"; };
+		CB3E48D4B9BABC5FB05CF463 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		1C23D9F5E0E43A6D75198CAB /* DetailsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DetailsView.swift; sourceTree = "<group>"; };
+		6FE63A6378702FDB2A4F67F5 /* DiskLensApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiskLensApp.swift; sourceTree = "<group>"; };
+		862F343CCAEC3ABDA503F7A5 /* Navigation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Navigation.swift; sourceTree = "<group>"; };
+		5AD2381595131FE14587F267 /* Node.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Node.swift; sourceTree = "<group>"; };
+		C280CC58040C85EC567ADFF5 /* ScanEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanEngine.swift; sourceTree = "<group>"; };
+		C4770739878DAAC382C85A74 /* ScanTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanTypes.swift; sourceTree = "<group>"; };
+		847ECA1A8B87CFC14D803B9E /* Scanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Scanner.swift; sourceTree = "<group>"; };
+		BE7EB1C8E2A398E1D57F67D2 /* Settings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Settings.swift; sourceTree = "<group>"; };
+		F02F5F5C6A33AB2D897E3A9F /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		0D8F1C62D18DC5F940075FC8 /* Support.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Support.swift; sourceTree = "<group>"; };
+		6960D47E51ACCBE33A0D9BDD /* TreeOutline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TreeOutline.swift; sourceTree = "<group>"; };
+		1954F2C7ABF4CFA3CBB8C567 /* TreemapView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TreemapView.swift; sourceTree = "<group>"; };
+		B2E4F6081A3C5D7E9F0A1B2C /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
+		D4061829B3AC5E7F9A0B1C2E /* AppIcon.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = AppIcon.icns; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		DAF6AA633395B1B76148E35B /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		2B731CEFC6751AAE0EC69B98 = {
+			isa = PBXGroup;
+			children = (
+				D8DBA3F9900DD17689CA0C4D /* DiskLens */,
+				86024CAD1E83101D97359D73 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		86024CAD1E83101D97359D73 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				F5BF48AA40CAD7891EB709FC /* DiskLens.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		D8DBA3F9900DD17689CA0C4D /* DiskLens */ = {
+			isa = PBXGroup;
+			children = (
+				F6FAF301F2935475D436E970 /* AnalysisViews.swift */,
+				AD23BF1A6021A99C05661810 /* AppModel.swift */,
+				A7CF1505EC3DE82A8CB3DCF0 /* ChartsView.swift */,
+				CB3E48D4B9BABC5FB05CF463 /* ContentView.swift */,
+				1C23D9F5E0E43A6D75198CAB /* DetailsView.swift */,
+				6FE63A6378702FDB2A4F67F5 /* DiskLensApp.swift */,
+				862F343CCAEC3ABDA503F7A5 /* Navigation.swift */,
+				5AD2381595131FE14587F267 /* Node.swift */,
+				C280CC58040C85EC567ADFF5 /* ScanEngine.swift */,
+				C4770739878DAAC382C85A74 /* ScanTypes.swift */,
+				847ECA1A8B87CFC14D803B9E /* Scanner.swift */,
+				BE7EB1C8E2A398E1D57F67D2 /* Settings.swift */,
+				F02F5F5C6A33AB2D897E3A9F /* SettingsView.swift */,
+				0D8F1C62D18DC5F940075FC8 /* Support.swift */,
+				6960D47E51ACCBE33A0D9BDD /* TreeOutline.swift */,
+				1954F2C7ABF4CFA3CBB8C567 /* TreemapView.swift */,
+				B2E4F6081A3C5D7E9F0A1B2C /* Theme.swift */,
+				D4061829B3AC5E7F9A0B1C2E /* AppIcon.icns */,
+			);
+			path = DiskLens;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		42AEFBAE01D2DFD981F7DA7D /* DiskLens */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 97C3CCC2320F36428F396148 /* Build configuration list for PBXNativeTarget "DiskLens" */;
+			buildPhases = (
+				0F78FE532035D122ED352DBA /* Sources */,
+				DAF6AA633395B1B76148E35B /* Frameworks */,
+				943E4BBD9B51C81965501BA3 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = DiskLens;
+			productName = DiskLens;
+			productReference = F5BF48AA40CAD7891EB709FC /* DiskLens.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		46F86FAA6BBF9AC94A7E4595 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					42AEFBAE01D2DFD981F7DA7D = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = B70BFAED9452B281FBE6DE10 /* Build configuration list for PBXProject "DiskLens" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 2B731CEFC6751AAE0EC69B98;
+			productRefGroup = 86024CAD1E83101D97359D73 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				42AEFBAE01D2DFD981F7DA7D /* DiskLens */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		943E4BBD9B51C81965501BA3 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C3F5071928AB4D6E8F0A1B2D /* AppIcon.icns in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		0F78FE532035D122ED352DBA /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				8C42622FBEADB60CD341F7ED /* AnalysisViews.swift in Sources */,
+				C42B122F4C5426FC64DC48E1 /* AppModel.swift in Sources */,
+				B47F40942A9B8541B4A95F18 /* ChartsView.swift in Sources */,
+				82FDB5029E6F8623BBAF7240 /* ContentView.swift in Sources */,
+				3C71317426F36E667881AD4B /* DetailsView.swift in Sources */,
+				546F4837DBB2CB3A1CF525A1 /* DiskLensApp.swift in Sources */,
+				252DFFAC1BC32C9651A76A60 /* Navigation.swift in Sources */,
+				C354738574951CAC908D0362 /* Node.swift in Sources */,
+				B656C372FB6283924393C74F /* ScanEngine.swift in Sources */,
+				EB6B6E38BC7FCDECCF234029 /* ScanTypes.swift in Sources */,
+				39C1A714370B2F16EB5A5080 /* Scanner.swift in Sources */,
+				5229C8C3201B440745517CFB /* Settings.swift in Sources */,
+				85D3D904B3E4CF11EF0A3042 /* SettingsView.swift in Sources */,
+				C13D9960A709521B9A68A1BF /* Support.swift in Sources */,
+				D2B2CE25B487C834A0044F51 /* TreeOutline.swift in Sources */,
+				4BB0AA373810A82FF89CEB68 /* TreemapView.swift in Sources */,
+				A1D3E5F7092B4C6D8E0F1A2B /* Theme.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		6F0B85FC643AF9C218F627EA /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		1B05A9D10F61E514E88AF240 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+			};
+			name = Release;
+		};
+		E67DED621DA82404399DCDC1 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 2;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = DiskLens;
+				INFOPLIST_FILE = DiskLens/Info.plist;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.1;
+				PRODUCT_BUNDLE_IDENTIFIER = local.disklens.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		8951287761002419191396D2 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 2;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = DiskLens;
+				INFOPLIST_FILE = DiskLens/Info.plist;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.1;
+				PRODUCT_BUNDLE_IDENTIFIER = local.disklens.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		B70BFAED9452B281FBE6DE10 /* Build configuration list for PBXProject "DiskLens" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				6F0B85FC643AF9C218F627EA /* Debug */,
+				1B05A9D10F61E514E88AF240 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		97C3CCC2320F36428F396148 /* Build configuration list for PBXNativeTarget "DiskLens" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E67DED621DA82404399DCDC1 /* Debug */,
+				8951287761002419191396D2 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 46F86FAA6BBF9AC94A7E4595 /* Project object */;
+}

@@ -1,0 +1,11 @@
+# Build output (build.sh and Xcode)
+build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+
+# Archives of the source; make them from git when needed
+*.zip
+
+# macOS Finder metadata
+.DS_Store
