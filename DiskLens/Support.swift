@@ -220,6 +220,22 @@ enum HistoryStore {
         load().filter { $0.path == path }.sorted { $0.date < $1.date }
     }
 
+    /// Replaces the entry of the same scan (same folder and time), e.g. once cloud folders were read.
+    static func update(_ entry: HistoryEntry) {
+        var all = load()
+        guard let index = all.lastIndex(where: { $0.path == entry.path && $0.date == entry.date }) else {
+            append(entry)
+            return
+        }
+        all[index] = entry
+        do {
+            try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+            try JSONEncoder().encode(all).write(to: fileURL, options: .atomic)
+        } catch {
+            Log.app.error("Couldn't save scan history: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
     /// The latest scan of each folder, newest first.
     static func recent(limit: Int = 8) -> [HistoryEntry] {
         var latest: [String: HistoryEntry] = [:]

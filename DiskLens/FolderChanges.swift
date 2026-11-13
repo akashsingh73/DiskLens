@@ -72,6 +72,9 @@ struct FolderSnapshot: Codable, Equatable, Sendable {
             var sizes: [String: Int64] = [:]
             sizes.reserveCapacity(node.children.count)
             for child in node.children {
+                // Folders not read (only in the cloud, or a scan stopped early) would look as if
+                // they had shrunk to nothing: leave them out.
+                if child.cloudOnly || child.pending { continue }
                 sizes[child.name] = child.allocated
                 if candidate.depth + 1 < maxDepth, !child.unreadable, !child.otherVolume {
                     candidates.append(Candidate(node: child, path: Self.join(candidate.path, child.name),
@@ -92,10 +95,12 @@ struct FolderSnapshot: Codable, Equatable, Sendable {
         var nodes: [String: Node] = ["": root]
         // A folder's path is shorter than any path inside it, so parents come before their children.
         for folder in earlier.children.keys.sorted(by: { ($0.utf8.count, $0) < ($1.utf8.count, $1) }) {
-            guard let node = nodes[folder], !node.unreadable, !node.otherVolume else { continue }
+            guard let node = nodes[folder], !node.unreadable, !node.otherVolume,
+                  !node.cloudOnly, !node.pending else { continue }
             var sizes: [String: Int64] = [:]
             sizes.reserveCapacity(node.children.count)
             for child in node.children {
+                if child.cloudOnly || child.pending { continue }
                 sizes[child.name] = child.allocated
                 let childPath = Self.join(folder, child.name)
                 if earlier.children[childPath] != nil { nodes[childPath] = child }

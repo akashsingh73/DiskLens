@@ -160,14 +160,109 @@ final class ScanResult: @unchecked Sendable {
     var unreadableFolders = 0
     var unreadableSamples: [String] = []
     var otherVolumeFolders = 0
+    /// Folders only in the cloud (not downloaded) that haven't been read: they take no space here.
+    var cloudOnlyFolders = 0
+    /// Those folders and where they are, for reading them after the scan.
+    var cloudFolders: [CloudFolder] = []
     var hardLinkDuplicates = 0
     var statErrors = 0
+    /// False while the scan is still running, and for a scan that was stopped before it finished.
+    var isComplete = false
 
-    init(root: Node, rootPath: String, displayName: String, started: Date) {
+    // For reading more of the tree later (cloud folders) the same way the scan did.
+    let rootDevice: UInt64
+    let topCount: Int
+    let links: HardLinkRegistry
+
+    init(root: Node, rootPath: String, displayName: String, started: Date,
+         rootDevice: UInt64 = 0, topCount: Int = 100, links: HardLinkRegistry = HardLinkRegistry()) {
         self.root = root
         self.rootPath = rootPath
         self.displayName = displayName
         self.started = started
+        self.rootDevice = rootDevice
+        self.topCount = topCount
+        self.links = links
+    }
+
+    /// Adds a part of the scan read later: its file types, ages, largest files and counts.
+    /// (Its folders are added to the tree with `Node.adopt(contentsOf:)`.)
+    func absorb(_ stats: ScanAccumulator) {
+        for (ext, totals) in stats.tally.extensions {
+            extensions[ext, default: ExtensionTotals()].merge(totals)
+        }
+        for i in ageAllocated.indices {
+            ageAllocated[i] += stats.tally.ageAllocated[i]
+            ageCounts[i] += stats.tally.ageCounts[i]
+        }
+        if !stats.top.items.isEmpty {
+            var heap = TopFileHeap(capacity: topCount)
+            for file in topFiles + stats.top.items where heap.wants(file.allocated) { heap.insert(file) }
+            topFiles = heap.sortedDescending()
+        }
+        unreadableFolders += stats.unreadable
+        for sample in stats.unreadableSamples where unreadableSamples.count < ScanAccumulator.sampleLimit {
+            unreadableSamples.append(sample)
+        }
+        otherVolumeFolders += stats.otherVolumes
+        cloudOnlyFolders += stats.cloudOnly
+        cloudFolders += stats.cloudFolders
+        hardLinkDuplicates += stats.hardLinkDuplicates
+        statErrors += stats.statErrors
+    }
+
+    /// Pieces that arrived before the piece holding their folder; see `fillIn(_ pieces:)`.
+    private var waitingPieces: [ObjectIdentifier: ScanPiece] = [:]
+
+    /// Pieces that couldn't be filled in yet (their folder is inside a piece not in the tree yet).
+    var piecesWaiting: Int { waitingPieces.count }
+
+    /// Fills in folders read later (during the scan, or cloud folders after it), in an order that
+    /// works: a piece whose folder was handed off from inside another piece waits until that one
+    /// is in the tree. Returns how many pieces went in.
+    @discardableResult
+    func fillIn(_ pieces: [ScanPiece]) -> Int {
+        var ready: [ScanPiece] = []
+        for piece in pieces {
+            if contains(piece.placeholder) {
+                ready.append(piece)
+            } else {
+                waitingPieces[ObjectIdentifier(piece.placeholder)] = piece
+            }
+        }
+        var added = 0
+        while let piece = ready.popLast() {
+            fillIn(piece)
+            added += 1
+            guard !waitingPieces.isEmpty else { continue }
+            // Pieces waiting for this one: their placeholders are now in the tree.
+            var stack = piece.placeholder.children
+            while let node = stack.popLast() {
+                if node.pending, let next = waitingPieces.removeValue(forKey: ObjectIdentifier(node)) {
+                    ready.append(next)
+                }
+                stack.append(contentsOf: node.children)
+            }
+        }
+        return added
+    }
+
+    /// True when `node` is part of this scan's tree (not of a piece still on its way).
+    func contains(_ node: Node) -> Bool {
+        var current: Node? = node
+        while let candidate = current {
+            if candidate === root { return true }
+            current = candidate.parent
+        }
+        return false
+    }
+
+    /// Fills in one folder read later. Its placeholder must already be in the tree.
+    func fillIn(_ piece: ScanPiece) {
+        let wasCloud = piece.placeholder.cloudOnly
+        piece.placeholder.adopt(contentsOf: piece.contents)
+        if wasCloud && !piece.placeholder.cloudOnly { cloudOnlyFolders = max(0, cloudOnlyFolders - 1) }
+        absorb(piece.stats)
     }
 
     /// The clock the scan measured file ages against (seconds since 1970).

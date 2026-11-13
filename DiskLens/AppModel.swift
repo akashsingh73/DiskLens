@@ -7,6 +7,15 @@ import os
 final class ScanStatus: ObservableObject {
     @Published var snapshot = ScanProgress.Snapshot()
     @Published var elapsed: TimeInterval = 0
+    /// Roughly how much space the scan will find, for a progress percentage: the last scan of
+    /// the same folder, or the space in use when scanning a whole disk. nil when unknown.
+    @Published var expected: Int64?
+
+    /// How far the scan has got (0…0.99), or nil when there is nothing to measure it against.
+    var fraction: Double? {
+        guard let expected, expected > 0 else { return nil }
+        return min(0.99, Double(snapshot.bytes) / Double(expected))
+    }
 }
 
 /// App state: the current scan, where the user is, navigation history, and scan control.
@@ -42,11 +51,26 @@ final class AppModel: ObservableObject {
     @Published var fullDiskAccess = FullDiskAccess.isGranted
     @Published var showingError = false
     @Published private(set) var errorText = ""
+    @Published private(set) var errorTitle = "Couldn't scan"
     @Published var showingUnreadable = false
     /// The folder being moved to the Trash, while its files are counted for File Types and Ages.
     @Published private(set) var trashingName: String?
     /// A file Details should select once it lists the folder being shown (a search result).
     @Published private(set) var fileToHighlight: String?
+
+    /// Reading folders that were only in the cloud, after a scan: how far it got. nil otherwise.
+    struct CloudStatus: Equatable {
+        var total: Int
+        var done: Int
+        var reading: [String]
+    }
+    @Published private(set) var cloudStatus: CloudStatus?
+
+    /// While the tree is still changing (a scan, or cloud folders being read after it), things
+    /// that rely on it staying put, like Move to Trash and search, wait.
+    var isReadingTree: Bool { isScanning || cloudStatus != nil }
+    /// The scan on screen is the one still being read (its tree is filling in).
+    var isShowingLiveScan: Bool { isScanning && result != nil && result === liveScan }
 
     let status = ScanStatus()
     let search = SearchModel()
@@ -58,6 +82,15 @@ final class AppModel: ObservableObject {
     private var activeProgress: ScanProgress?
     private var pollTask: Task<Void, Never>?
     private var scanActivity: NSObjectProtocol?
+    /// The scan shown while it is still being read (its tree fills in as folders finish).
+    private var liveScan: ScanResult?
+    private var lastRedraw = Date.distantPast
+    private var needsRedraw = false
+    /// Where the user was, to go back there when a rescan of the same folder finishes.
+    private var placeToKeep: String?
+    private var cloudProgress: ScanProgress?
+    private var cloudPoll: Task<Void, Never>?
+    private var cloudActivity: NSObjectProtocol?
     private var mouseMonitor: Any?
     private var snapshotTask: Task<Void, Never>?
     private static let historyLimit = 500
@@ -77,10 +110,15 @@ final class AppModel: ObservableObject {
 
     // MARK: - Scanning
 
+    /// Scans a folder. The tree appears as soon as the first two levels are read (a fraction of a
+    /// second); the folders below fill in as they finish, then any folders only in the cloud are
+    /// read in the background (unless Settings says to skip them).
     func scan(path requested: String) {
         guard !isScanning else { return }
+        stopReadingCloud()
         let target = Self.resolve(requested)
         let progress = ScanProgress()
+        let inbox = ScanInbox()
         let started = Date()
         let path = target.path
         let name = target.displayName
@@ -88,12 +126,19 @@ final class AppModel: ObservableObject {
 
         search.scanStarted()
         activeProgress = progress
+        liveScan = nil
         isScanning = true
         scanningName = name
         status.snapshot = ScanProgress.Snapshot()
         status.elapsed = 0
+        status.expected = Self.expectedSize(of: path)
         showingError = false
         fullDiskAccess = FullDiskAccess.isGranted
+        // Rescanning the same folder keeps your place once the scan gets there.
+        placeToKeep = nil
+        if let old = result, old.rootPath == path, let current = selection {
+            placeToKeep = current.directory.path
+        }
         // Keeps macOS from slowing the scan down while DiskLens is in the background.
         scanActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Scanning a folder")
         Log.scan.info("Scan started: \(path, privacy: .public)")
@@ -105,15 +150,41 @@ final class AppModel: ObservableObject {
                 guard let self, self.activeProgress === progress else { return }
                 self.status.snapshot = progress.read()
                 self.status.elapsed = Date().timeIntervalSince(started)
+                if let scan = self.liveScan { self.fillIn(from: inbox, into: scan, redrawEvery: 0.5) }
             }
         }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let outcome = ScanEngine.scan(path: path, displayName: name, topCount: topCount, progress: progress)
-            Task { @MainActor [weak self] in
-                self?.finish(outcome, progress: progress)
+            let outcome = ScanEngine.stream(path: path, displayName: name, topCount: topCount, progress: progress,
+                                            showTree: { tree in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { self?.show(tree, progress: progress) }
+                }
+            }, deliver: { inbox.add($0) })
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.finish(outcome, progress: progress, inbox: inbox) }
             }
         }
+    }
+
+    /// The first two levels are read: show the tree, with the folders below still to come.
+    private func show(_ tree: ScanResult, progress: ScanProgress) {
+        guard progress === activeProgress else { return }
+        liveScan = tree
+        install(tree)
+    }
+
+    /// Adds the folders that finished since last time to the tree on screen. Redraws at most
+    /// every `redrawEvery` seconds: each redraw rebuilds the tree's rows and the views.
+    private func fillIn(from inbox: ScanInbox, into scan: ScanResult, redrawEvery interval: TimeInterval) {
+        let pieces = inbox.takeAll()
+        if !pieces.isEmpty, scan.fillIn(pieces) > 0 {
+            needsRedraw = true
+        }
+        guard needsRedraw, result === scan, Date().timeIntervalSince(lastRedraw) >= interval else { return }
+        needsRedraw = false
+        lastRedraw = Date()
+        version += 1
     }
 
     func rescan() {
@@ -138,60 +209,153 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func finish(_ outcome: ScanOutcome, progress: ScanProgress) {
+    private func finish(_ outcome: ScanOutcome, progress: ScanProgress, inbox: ScanInbox) {
         guard progress === activeProgress else { return }
         pollTask?.cancel()
         pollTask = nil
         activeProgress = nil
-        isScanning = false
         if let activity = scanActivity {
             ProcessInfo.processInfo.endActivity(activity)
             scanActivity = nil
         }
+        let scan = liveScan
+        liveScan = nil
+        if let scan { fillIn(from: inbox, into: scan, redrawEvery: 0) }
+        isScanning = false
 
         switch outcome {
         case .cancelled:
-            Log.scan.info("Scan cancelled")
+            Log.scan.info("Scan stopped")
+            // What was read so far stays on screen; folders not read yet are marked as such.
+            if let scan, result === scan { version += 1 }
         case .failed(let message):
             Log.scan.error("Scan failed: \(message, privacy: .public)")
+            errorTitle = "Couldn't scan"
             errorText = message
             showingError = true
-        case .finished(let newResult):
-            install(newResult)
+        case .finished(let finished):
+            finished.duration = Date().timeIntervalSince(finished.started)
+            finished.isComplete = true
+            complete(finished)
         }
     }
 
+    /// Puts a scan on screen: the tree (possibly still filling in), with the whole scan selected.
     private func install(_ newResult: ScanResult) {
-        let root = newResult.root
-        let seconds = newResult.duration
-        let unreadable = newResult.unreadableFolders
-        Log.scan.info("Scan finished: \(root.fileCount) files, \(root.folderCount) folders, \(unreadable) unreadable, \(seconds, format: .fixed(precision: 1)) s")
-
-        // Rescanning the same folder keeps your place.
-        var keepPath: String?
-        if let old = result, old.rootPath == newResult.rootPath, let current = selection {
-            keepPath = current.directory.path
-        }
-
+        // Freeing a big tree takes a moment: let the old one go off the main thread.
+        let previous = result
         result = newResult
+        if let previous { DispatchQueue.global(qos: .utility).async { _ = previous } }
         search.scanChanged()
         backStack.removeAll()
         forwardStack.removeAll()
         cameFrom = nil
         fileHighlightHandled()
-        if let keepPath, let node = root.descendant(atPath: keepPath) {
-            selection = node
-        } else {
-            selection = root
-        }
+        selection = newResult.root
+        comparisonBases = nil
+        changes = nil
+        lastRedraw = Date()
+        needsRedraw = false
         revealToken += 1
         version += 1
+    }
 
-        HistoryStore.append(HistoryEntry(path: newResult.rootPath, date: newResult.started,
-                                         size: root.size, allocated: root.allocated, files: root.fileCount))
-        history = HistoryStore.entries(for: newResult.rootPath)
+    /// The scan is read in full (everything on this Mac): record it, go back to where the user was
+    /// on a rescan, and read any folders only in the cloud.
+    private func complete(_ scan: ScanResult) {
+        let root = scan.root
+        let seconds = scan.duration
+        Log.scan.info("Scan finished: \(root.fileCount) files, \(root.folderCount) folders, \(scan.unreadableFolders) unreadable, \(scan.cloudOnlyFolders) only in the cloud, \(seconds, format: .fixed(precision: 1)) s")
+        guard result === scan else { return }
+
+        if let keep = placeToKeep, selection === root, let node = root.descendant(atPath: keep) {
+            selection = node
+            revealToken += 1
+        }
+        placeToKeep = nil
+        version += 1
+
+        HistoryStore.append(historyEntry(for: scan))
+        history = HistoryStore.entries(for: scan.rootPath)
         recentScans = HistoryStore.recent()
-        recordSnapshot(of: newResult)
+
+        if Prefs.cloudFolderMode == .read && !scan.cloudFolders.isEmpty {
+            readCloudFolders()       // records the snapshot when it's done
+        } else {
+            recordSnapshot(of: scan)
+        }
+    }
+
+    private func historyEntry(for scan: ScanResult) -> HistoryEntry {
+        HistoryEntry(path: scan.rootPath, date: scan.started, size: scan.root.size,
+                     allocated: scan.root.allocated, files: scan.root.fileCount)
+    }
+
+    // MARK: - Folders only in the cloud
+
+    /// Reads the scan's folders that are only in the cloud, fetching them from the internet, in
+    /// the background. They fill in on screen as they arrive; `stopReadingCloud` stops.
+    func readCloudFolders() {
+        guard let scan = result, scan.isComplete, !isScanning, cloudProgress == nil else { return }
+        let folders = scan.cloudFolders.filter { $0.node.cloudOnly }
+        guard !folders.isEmpty else { return }
+        let progress = ScanProgress()
+        let inbox = ScanInbox()
+        cloudProgress = progress
+        cloudStatus = CloudStatus(total: folders.count, done: 0, reading: [])
+        cloudActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiated,
+                                                               reason: "Reading folders from the cloud")
+        Log.scan.info("Reading \(folders.count) folders from the cloud")
+        let rootDevice = scan.rootDevice
+        let links = scan.links
+        let topCount = scan.topCount
+        let now = scan.scanTime
+
+        cloudPoll?.cancel()
+        cloudPoll = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                guard let self, self.cloudProgress === progress else { return }
+                let snapshot = progress.read()
+                self.cloudStatus = CloudStatus(total: max(snapshot.branchesTotal, folders.count),
+                                               done: snapshot.branchesDone, reading: snapshot.reading)
+                self.fillIn(from: inbox, into: scan, redrawEvery: 1)
+            }
+        }
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            ScanEngine.readCloudFolders(folders, rootDevice: rootDevice, links: links, topCount: topCount,
+                                        now: now, progress: progress, deliver: { inbox.add($0) })
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.cloudFinished(progress: progress, inbox: inbox, scan: scan) }
+            }
+        }
+    }
+
+    /// Stops reading cloud folders. What arrived so far stays; the rest stay marked as in the cloud.
+    func stopReadingCloud() {
+        cloudProgress?.cancel()
+    }
+
+    private func cloudFinished(progress: ScanProgress, inbox: ScanInbox, scan: ScanResult) {
+        guard progress === cloudProgress else { return }
+        cloudPoll?.cancel()
+        cloudPoll = nil
+        cloudProgress = nil
+        if let activity = cloudActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            cloudActivity = nil
+        }
+        fillIn(from: inbox, into: scan, redrawEvery: 0)
+        cloudStatus = nil
+        scan.cloudFolders = scan.cloudFolders.filter { $0.node.cloudOnly }
+        Log.scan.info("Cloud folders read; \(scan.cloudFolders.count) left unread")
+        guard result === scan else { return }
+        version += 1
+        HistoryStore.update(historyEntry(for: scan))
+        history = HistoryStore.entries(for: scan.rootPath)
+        recentScans = HistoryStore.recent()
+        recordSnapshot(of: scan)
     }
 
     // MARK: - Changes since an earlier scan
@@ -225,6 +389,19 @@ final class AppModel: ObservableObject {
         let base = bases[comparisonIndex]
         let now = FolderSnapshot(root: scan.root, path: scan.rootPath, date: scan.started, opening: base)
         changes = FolderComparison(base: base, current: now)
+    }
+
+    /// Roughly how much a scan of `path` will find: what the last scan of it found, or for a
+    /// whole disk, the space in use on it.
+    static func expectedSize(of path: String) -> Int64? {
+        if let last = HistoryStore.entries(for: path).last, last.allocated > 0 { return last.allocated }
+        let components = (path as NSString).pathComponents
+        let isDisk = path == "/" || path == "/System/Volumes/Data"
+            || (components.count == 3 && components[1] == "Volumes")
+        if isDisk, let volume = volumeInfo(at: path), volume.total > volume.available {
+            return volume.total - volume.available
+        }
+        return nil
     }
 
     /// The folder to scan for a path the user picked, and the name to show for it.
@@ -333,10 +510,20 @@ final class AppModel: ObservableObject {
 
     // MARK: - Trash
 
+    /// Moving things to the Trash waits until the tree stops changing.
+    private func explainWaitForScan() {
+        errorTitle = "Wait for the scan to finish"
+        errorText = cloudStatus != nil
+            ? "DiskLens is still reading folders from the cloud. Moving things to the Trash works once it's done, or stop reading them in the summary above the folder tree."
+            : "DiskLens is still reading folders. Moving things to the Trash works once the scan is done."
+        showingError = true
+    }
+
     /// Moves a folder to the Trash and takes it out of the scan, including the File Types and
     /// Ages totals. Those come from the folder's files, which are read again while the user
     /// answers the confirmation (the scan keeps only folder totals), using the scan's rules.
     func trash(node: Node) {
+        guard !isReadingTree else { return explainWaitForScan() }
         guard trashingName == nil, node.kind == .directory, node.parent != nil,
               let scan = result, belongsToCurrentScan(node) else {
             NSSound.beep()
@@ -381,6 +568,7 @@ final class AppModel: ObservableObject {
     /// Moves one file to the Trash and takes it out of the scan. `uncountedLink` is set for a hard
     /// link whose space the scan counted through another link: the totals don't change for it.
     func trashFile(path: String, size: Int64, allocated: Int64, modified: Int64, uncountedLink: FileKey? = nil) {
+        guard !isReadingTree else { return explainWaitForScan() }
         guard trashingName == nil else {
             NSSound.beep()
             return

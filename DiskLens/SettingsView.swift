@@ -10,6 +10,7 @@ struct SettingsView: View {
     @AppStorage(Prefs.treemapCushion) private var treemapCushion: Bool = true
     @AppStorage(Prefs.treemapColoring) private var treemapColoring: TreemapColoring = .branch
     @AppStorage(Prefs.topFilesCount) private var topFilesCount: Int = 100
+    @AppStorage(Prefs.cloudFolders) private var cloudFolders: CloudFolderMode = .read
 
     var body: some View {
         TabView {
@@ -100,6 +101,14 @@ struct SettingsView: View {
                 Text("Largest files to list: \(topFilesCount)")
             }
             Text("Applies to the next scan.").font(.caption).foregroundStyle(.secondary)
+
+            Picker("Folders only in the cloud", selection: $cloudFolders) {
+                ForEach(CloudFolderMode.allCases) { mode in Text(mode.title).tag(mode) }
+            }
+            Text("iCloud Drive, Google Drive, Dropbox and OneDrive keep folders you haven't opened in the cloud. \(cloudFolders.help)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
             LabeledContent("Full Disk Access") {
                 HStack {

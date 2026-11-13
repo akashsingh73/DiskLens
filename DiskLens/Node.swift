@@ -33,6 +33,8 @@ final class Node: Identifiable, @unchecked Sendable {
 
     var unreadable = false       // could not be opened (permissions)
     var otherVolume = false      // a mount point for another disk; not scanned
+    var cloudOnly = false        // only in the cloud (iCloud Drive, Google Drive…); not read (yet)
+    var pending = false          // still being read; its contents arrive later (see `adopt`)
     var unreadableCount = 0      // unreadable folders anywhere in this branch
 
     /// Hard links directly in this folder that were not counted, because the scan had already
@@ -172,6 +174,40 @@ final class Node: Identifiable, @unchecked Sendable {
         guard var links = uncountedLinks, let count = links[key] else { return }
         links[key] = count > 1 ? count - 1 : nil
         uncountedLinks = links.isEmpty ? nil : links
+    }
+
+    // MARK: - Filling in a folder read later
+
+    /// Takes over the contents of `scanned` (this same folder, read on another thread into a
+    /// tree of its own) and updates the totals of every folder above. This is how folders read
+    /// during a scan, and cloud folders read after it, appear in a tree that is already on screen.
+    /// Main thread once the tree is shown.
+    func adopt(contentsOf scanned: Node) {
+        let before = (size: size, allocated: allocated, files: fileCount, folders: folderCount,
+                      unreadable: unreadableCount)
+        children = scanned.children
+        for child in children { child.parent = self }
+        ownSize = scanned.ownSize
+        ownAllocated = scanned.ownAllocated
+        ownFileCount = scanned.ownFileCount
+        ownNewest = scanned.ownNewest
+        uncountedLinks = scanned.uncountedLinks
+        unreadable = scanned.unreadable
+        cloudOnly = scanned.cloudOnly
+        pending = false
+        finalize()
+        scanned.children = []
+
+        var current = parent
+        while let node = current {
+            node.size += size - before.size
+            node.allocated += allocated - before.allocated
+            node.fileCount += fileCount - before.files
+            node.folderCount += folderCount - before.folders
+            node.unreadableCount += unreadableCount - before.unreadable
+            if newest > node.newest { node.newest = newest }
+            current = node.parent
+        }
     }
 
     // MARK: - Updates after a deletion

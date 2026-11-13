@@ -271,7 +271,7 @@ struct TreeOutline: NSViewRepresentable {
             guard let node = clickedNode else { return false }
             switch menuItem.action {
             case #selector(moveToTrash(_:)):
-                return node.kind == .directory && !node.isRoot && !node.otherVolume
+                return node.kind == .directory && !node.isRoot && !node.otherVolume && !node.pending && !model.isReadingTree
             case #selector(expandAll(_:)), #selector(collapseAll(_:)):
                 return node.kind == .directory && !node.children.isEmpty
             default:
@@ -339,6 +339,7 @@ final class TreeCellView: NSTableCellView {
     private static let filesIcon = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Files")
     private static let lockIcon = NSImage(systemSymbolName: "lock.fill", accessibilityDescription: "No access")
     private static let driveIcon = NSImage(systemSymbolName: "externaldrive", accessibilityDescription: "Other volume")
+    private static let cloudIcon = NSImage(systemSymbolName: "icloud", accessibilityDescription: "Only in the cloud")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -368,7 +369,10 @@ final class TreeCellView: NSTableCellView {
 
     func configure(node: Node, root: Node, settings: DisplaySettings) {
         nameLabel.stringValue = node.unreadable ? node.name + "  (no access)" : node.name
-        sizeLabel.stringValue = node.otherVolume ? "other disk" : settings.label(for: node)
+        sizeLabel.stringValue = node.otherVolume ? "other disk"
+            : node.cloudOnly ? "in the cloud"
+            : node.pending ? "reading…"
+            : settings.label(for: node)
 
         let total: Double
         switch settings.barScale {
@@ -385,12 +389,14 @@ final class TreeCellView: NSTableCellView {
         let rootShare = settings.metric(root) > 0 ? settings.metric(node) / settings.metric(root) : 0
         let bold = node !== root && rootShare * 100 >= settings.boldPercent && settings.boldPercent > 0
         nameLabel.font = bold ? .boldSystemFont(ofSize: NSFont.systemFontSize) : .systemFont(ofSize: NSFont.systemFontSize)
-        nameLabel.textColor = node.unreadable || node.otherVolume ? .secondaryLabelColor : .labelColor
+        nameLabel.textColor = node.unreadable || node.otherVolume || node.cloudOnly || node.pending
+            ? .secondaryLabelColor : .labelColor
 
         switch true {
         case node.kind == .files: icon.image = Self.filesIcon
         case node.unreadable: icon.image = Self.lockIcon
         case node.otherVolume: icon.image = Self.driveIcon
+        case node.cloudOnly: icon.image = Self.cloudIcon
         case node.name.hasSuffix(".app"): icon.image = NSWorkspace.shared.icon(forFile: node.path)
         default: icon.image = Self.folderIcon
         }
@@ -410,6 +416,8 @@ final class TreeCellView: NSTableCellView {
             lines.append("Last modified: \(date.formatted(date: .abbreviated, time: .shortened))")
         }
         if node.unreadableCount > 0 { lines.append("Unreadable folders inside: \(node.unreadableCount)") }
+        if node.cloudOnly { lines.append("Only in the cloud: not downloaded, so it takes no space on this Mac") }
+        if node.pending { lines.append("Still being read") }
         return lines.joined(separator: "\n")
     }
 

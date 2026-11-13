@@ -15,7 +15,7 @@ struct DetailItem: Identifiable, Hashable, Sendable {
     let folders: Int
     let modified: Date
     let kind: String
-    let percent: Double         // share of the folder's space on disk
+    var percent: Double         // share of the folder's space on disk
     let unreadable: Bool
     /// Set for a hard link whose space the scan counted through another link to the same file.
     /// Its On Disk is 0, because moving it to the Trash frees nothing.
@@ -27,8 +27,13 @@ struct DetailItem: Identifiable, Hashable, Sendable {
     /// Biggest growth first when sorted descending; rows with nothing to compare come last.
     var changeSortKey: Int64 { change?.change ?? Int64.min }
 
-    /// The path, plus the change: it arrives a moment after a scan, and the table only redraws rows that differ.
-    static func == (lhs: DetailItem, rhs: DetailItem) -> Bool { lhs.id == rhs.id && lhs.change == rhs.change }
+    /// The path plus everything shown that can change while the same row stays (sizes grow while a
+    /// scan fills in, the change arrives a moment after it): the table only redraws rows that differ.
+    static func == (lhs: DetailItem, rhs: DetailItem) -> Bool {
+        lhs.id == rhs.id && lhs.change == rhs.change && lhs.allocated == rhs.allocated && lhs.size == rhs.size
+            && lhs.files == rhs.files && lhs.folders == rhs.folders && lhs.kind == rhs.kind
+            && lhs.percent == rhs.percent && lhs.modified == rhs.modified
+    }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
@@ -356,7 +361,7 @@ struct DetailsView: View {
             for child in directory.children {
                 let childPath = (path as NSString).appendingPathComponent(child.name)
                 lookup[childPath] = child
-                let kind = child.otherVolume ? "Other disk" : (child.unreadable ? "No access" : "Folder")
+                let kind = child.otherVolume ? "Other disk" : child.cloudOnly ? "In the cloud" : child.pending ? "Reading…" : (child.unreadable ? "No access" : "Folder")
                 let relative = rootPath.flatMap { FolderSnapshot.relativePath(of: childPath, inside: $0) }
                 folderRows.append(DetailItem(
                     id: childPath, name: child.name, isFolder: true,
@@ -370,15 +375,37 @@ struct DetailsView: View {
             }
         }
         state.folderLookup = lookup
+        let folderID = ObjectIdentifier(directory)
+        let sameFolder = state.shownFolder == folderID
+        state.shownFolder = folderID
+        if !sameFolder {
+            // Coming back up from a subfolder: highlight the folder you came out of.
+            if let child = Self.child(of: directory, leadingTo: model.cameFrom), child.kind == .directory {
+                state.selection = [(path as NSString).appendingPathComponent(child.name)]
+            } else {
+                state.selection = []
+            }
+        }
+        // The same folder redrawn (sizes changed while a scan fills in) and its own files
+        // unchanged: reuse the files read last time instead of reading them again.
+        if let cached = state.cachedFiles, cached.folder == folderID,
+           cached.ownFiles == directory.ownFileCount, cached.ownAllocated == directory.ownAllocated {
+            let files = cached.listing.items.map { item -> DetailItem in
+                var copy = item
+                copy.percent = total > 0 ? Double(item.allocated) / Double(total) : 0
+                return copy
+            }
+            state.show(folderRows + files)
+            state.totalFiles = cached.listing.total
+            state.hiddenFiles = max(0, cached.listing.total - cached.listing.items.count)
+            state.loading = false
+            state.listedFolder = path
+            showPendingFile()
+            return
+        }
         state.show(folderRows)
         state.totalFiles = 0
         state.hiddenFiles = 0
-        // Coming back up from a subfolder: highlight the folder you came out of.
-        if let child = Self.child(of: directory, leadingTo: model.cameFrom), child.kind == .directory {
-            state.selection = [(path as NSString).appendingPathComponent(child.name)]
-        } else {
-            state.selection = []
-        }
         guard directory.ownFileCount > 0, !directory.unreadable else {
             state.loading = false
             state.listedFolder = path
@@ -393,6 +420,7 @@ struct DetailsView: View {
             DetailLoader.listFiles(in: path, folderTotal: total, uncounted: uncounted)
         }.value
         if Task.isCancelled { return }
+        state.cachedFiles = (folderID, directory.ownFileCount, directory.ownAllocated, listing)
         state.show(folderRows + listing.items)
         state.totalFiles = listing.total
         state.hiddenFiles = max(0, listing.total - listing.items.count)
@@ -455,6 +483,10 @@ final class DetailsState: ObservableObject {
     @Published var scrollTarget: DetailItem.ID?
     /// The folder whose files are fully listed in `rows`, nil while they are being read.
     var listedFolder: String?
+    /// The folder shown last, to tell a new folder from the same one redrawn (while a scan fills in).
+    var shownFolder: ObjectIdentifier?
+    /// The files of the folder read last, reused while its own files stay the same.
+    var cachedFiles: (folder: ObjectIdentifier, ownFiles: Int, ownAllocated: Int64, listing: DetailLoader.Listing)?
     @Published var loading = false
     @Published var totalFiles = 0
     @Published var hiddenFiles = 0

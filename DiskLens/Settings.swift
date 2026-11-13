@@ -99,6 +99,28 @@ enum TreemapColoring: String, CaseIterable, Identifiable {
     }
 }
 
+/// What to do with folders that are only in the cloud (iCloud Drive, Google Drive, Dropbox…).
+enum CloudFolderMode: String, CaseIterable, Identifiable {
+    case read, skip
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .read: return "Read them after the scan, in the background"
+        case .skip: return "Skip them"
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .read:
+            return "Everything on this Mac shows up first. Then DiskLens fetches the folders that are only in the cloud from the internet and fills them in as they arrive; that can take a while for a big drive. Files that aren't downloaded count as 0 on disk (they take no space here) but show their size in Size mode."
+        case .skip:
+            return "Folders that are only in the cloud are marked and left unread: they take no space on this Mac. You can still read them from the summary above the folder tree."
+        }
+    }
+}
+
 // MARK: - Stored preferences
 
 enum Prefs {
@@ -122,6 +144,12 @@ enum Prefs {
 
     static let defaultBarStart = "#7DBBFFFF"
     static let defaultBarEnd = "#3478F6FF"
+
+    static let cloudFolders = "cloudFolders"
+
+    static var cloudFolderMode: CloudFolderMode {
+        UserDefaults.standard.string(forKey: cloudFolders).flatMap(CloudFolderMode.init(rawValue:)) ?? .read
+    }
 
     static var topFilesCountValue: Int {
         let stored = UserDefaults.standard.integer(forKey: topFilesCount)

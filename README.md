@@ -8,7 +8,8 @@ and how old your data is.
 
 - **Free and open source** under the MIT license. No account, no ads, no telemetry.
 - **Private**: DiskLens never connects to the internet. Everything stays on your Mac.
-- **Fast and native**: built with SwiftUI and AppKit, it scans about half a million files in a few seconds.
+- **Fast and native**: built with SwiftUI and AppKit, it reads about half a million files in under two seconds on
+  every core at once, and shows the folder tree within a moment, filling it in as the scan goes.
 - **Easy to build**: one command with Apple's free Command Line Tools. No Xcode, no Apple developer account,
   no Gatekeeper warnings.
 
@@ -61,6 +62,14 @@ ad-hoc signature, so use `build.sh` for the copy you keep in Applications.
 
 ## Features
 
+- **Live results**: the folder tree, treemap and charts appear as soon as the top folders are listed and fill in
+  as each folder is read. The summary card shows how far the scan has got (as a percentage when there is an
+  earlier scan of the same folder, or for a whole disk) and which folders it is still reading, with Stop.
+- **Cloud folders** (iCloud Drive, Google Drive, Dropbox, OneDrive): folders you haven't opened yet are only in the
+  cloud, and listing them means fetching from the internet, which can take minutes. DiskLens never waits for
+  them during the scan: it reads everything on your Mac first, then fetches those folders in the background with
+  their own progress bar, filling them in as they arrive. Settings ▸ Scanning can skip them instead ("Read Now"
+  in the summary card fetches them later).
 - **Summary card**: the scan's total, how much of the disk it takes, and file and folder counts.
 - **Folder tree** with a size bar on every row (scaled to the whole scan, or to the parent folder), bold for big
   folders, a `[Files]` entry for each folder's loose files, and an option to hide small items.
@@ -113,6 +122,8 @@ ad-hoc signature, so use `build.sh` for the copy you keep in Applications.
 
 ## How sizes are counted
 
+- Files that are only in the cloud take no space on your Mac, so they count as 0 On Disk; Size mode shows their full
+  size.
 - **On Disk** uses the blocks a file really occupies, so iCloud files that aren't downloaded, sparse files (such as
   Docker's disk image) and compressed files count honestly. It matches `du`.
 - Hard-linked files are counted once. In Details, the other links show 0 on disk and the kind
@@ -176,6 +187,11 @@ A few rules keep DiskLens stable; please keep to them:
 - **No SwiftUI macros** (`@State`, `@Observable`): the Command Line Tools don't include the plugin they need.
   View state lives in small `ObservableObject` classes instead.
 - **Threads**: the scan runs on background threads; everything on screen is updated on the main thread only.
+  Once the tree is on screen it belongs to the main thread: scan workers read folders into trees of their own
+  ("pieces", see `ScanEngine.stream`) and the main thread fills them in with `ScanResult.fillIn`.
+- **Speed**: one worker per core shares a queue of folders; a busy worker hands subfolders to idle ones
+  (`WorkQueue`), so lopsided folders don't leave cores idle. Measure before and after any change to the scanner.
+- **Never wait on the cloud during a scan**: scan threads run with cloud fetching turned off (`CloudFiles`).
 - **Big folders stay responsive**: Details lists at most the 50,000 largest files of a folder, "Expand All
   Below" stops after a few thousand folders, and search keeps only the 500 largest matches and reads folders on
   background threads, stopping as soon as the text changes.

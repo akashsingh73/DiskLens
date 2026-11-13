@@ -7,15 +7,31 @@ import Glibc
 
 /// Thread-safe progress counters and the cancel flag for one scan.
 final class ScanProgress: @unchecked Sendable {
+    enum Phase: Sendable {
+        /// Reading the first two levels, which decides how the rest is split up.
+        case listing
+        /// Reading the folders below those, several at a time.
+        case reading
+        /// All folders read; adding up the totals.
+        case finishing
+    }
+
     struct Snapshot {
         var files = 0
         var folders = 0
         var bytes: Int64 = 0
         var currentPath = ""
+        var phase = Phase.listing
+        /// The folders read in parallel (each with everything inside it), and how many are done.
+        var branchesTotal = 0
+        var branchesDone = 0
+        /// The folders being read right now, longest-running first.
+        var reading: [String] = []
     }
 
     private let lock = NSLock()
     private var snapshot = Snapshot()
+    private var active: [Int: (path: String, since: Date)] = [:]
     private var cancelled = false
 
     func add(files: Int, folders: Int, bytes: Int64, currentPath: String?) {
@@ -27,10 +43,46 @@ final class ScanProgress: @unchecked Sendable {
         lock.unlock()
     }
 
+    func startReading(branches: Int) {
+        lock.lock()
+        snapshot.phase = .reading
+        snapshot.branchesTotal = branches
+        lock.unlock()
+    }
+
+    /// A busy worker handed part of its folder to an idle one.
+    func branchAdded() {
+        lock.lock()
+        snapshot.branchesTotal += 1
+        lock.unlock()
+    }
+
+    func branchStarted(_ index: Int, path: String) {
+        lock.lock()
+        active[index] = (path, Date())
+        lock.unlock()
+    }
+
+    func branchFinished(_ index: Int) {
+        lock.lock()
+        active[index] = nil
+        snapshot.branchesDone += 1
+        lock.unlock()
+    }
+
+    func startFinishing() {
+        lock.lock()
+        snapshot.phase = .finishing
+        active.removeAll()
+        lock.unlock()
+    }
+
     func read() -> Snapshot {
         lock.lock()
         defer { lock.unlock() }
-        return snapshot
+        var copy = snapshot
+        copy.reading = active.values.sorted { $0.since < $1.since }.map(\.path)
+        return copy
     }
 
     func cancel() {
@@ -44,6 +96,27 @@ final class ScanProgress: @unchecked Sendable {
         defer { lock.unlock() }
         return cancelled
     }
+}
+
+/// Cloud storage folders (iCloud Drive, Google Drive, Dropbox, OneDrive…) keep most of their
+/// folders in the cloud until something opens them; opening one makes macOS fetch its contents
+/// from the internet first, which can make a scan crawl for many minutes. DiskLens never needs
+/// that: what is only in the cloud takes no space on this Mac.
+enum CloudFiles {
+    /// Runs `body` with this thread set never to fetch anything from the cloud. Opening a folder
+    /// that is only in the cloud then fails at once (with `EDEADLK`) instead of waiting.
+    static func withoutFetching<T>(_ body: () throws -> T) rethrows -> T {
+        let type = IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
+        let previous = getiopolicy_np(type, IOPOL_SCOPE_THREAD)
+        setiopolicy_np(type, IOPOL_SCOPE_THREAD, IOPOL_MATERIALIZE_DATALESS_FILES_OFF)
+        defer {
+            if previous >= 0 { setiopolicy_np(type, IOPOL_SCOPE_THREAD, previous) }
+        }
+        return try body()
+    }
+
+    /// True for the error a folder that is only in the cloud gives while fetching is off.
+    static func isCloudOnly(errorCode: Int32) -> Bool { errorCode == EDEADLK }
 }
 
 /// Remembers hard-linked files so their space is counted only once.
@@ -67,6 +140,7 @@ struct FileFacts {
     var inode: UInt64
     var links: UInt64
     var mode: UInt32
+    var flags: UInt32
     var isDirectory: Bool
 
     init(_ st: stat) {
@@ -75,6 +149,7 @@ struct FileFacts {
         inode = UInt64(st.st_ino)
         links = UInt64(st.st_nlink)
         mode = UInt32(st.st_mode)
+        flags = UInt32(st.st_flags)
         isDirectory = (mode & UInt32(S_IFMT)) == UInt32(S_IFDIR)
         device = FileFacts.normalize(st.st_dev)
         #if canImport(Darwin)
@@ -85,6 +160,9 @@ struct FileFacts {
     }
 
     var key: FileKey { FileKey(device: device, inode: inode) }
+    /// Only in the cloud (iCloud Drive, Google Drive, Dropbox, OneDrive…): nothing of it is on this
+    /// Mac, and for a folder even the list of what's inside has to be fetched from the internet.
+    var isDataless: Bool { flags & UInt32(SF_DATALESS) != 0 }
     var isSymbolicLink: Bool { (mode & UInt32(S_IFMT)) == UInt32(S_IFLNK) }
     var isExecutable: Bool { mode & 0o111 != 0 }
 
@@ -137,6 +215,9 @@ struct ScanAccumulator {
     var unreadable = 0
     var unreadableSamples: [String] = []
     var otherVolumes = 0
+    var cloudOnly = 0
+    /// The folders only in the cloud this part of the scan left unread, to read later.
+    var cloudFolders: [CloudFolder] = []
     var hardLinkDuplicates = 0
     var statErrors = 0
 
@@ -194,8 +275,126 @@ struct ScanAccumulator {
             unreadableSamples.append(sample)
         }
         otherVolumes += other.otherVolumes
+        cloudOnly += other.cloudOnly
+        cloudFolders += other.cloudFolders
         hardLinkDuplicates += other.hardLinkDuplicates
         statErrors += other.statErrors
+    }
+}
+
+/// A folder only in the cloud that a scan left unread, and where it sits in the tree.
+struct CloudFolder: @unchecked Sendable {
+    let path: String
+    let name: String
+    /// Belongs to the tree; touched only on the thread that owns the tree.
+    let node: Node
+}
+
+/// One part of a scan, read on a worker thread into a tree of its own: the contents of
+/// `placeholder` (a folder already in the tree on screen), plus its statistics.
+struct ScanPiece: @unchecked Sendable {
+    let placeholder: Node
+    let contents: Node
+    let stats: ScanAccumulator
+}
+
+/// The folders waiting to be read, shared by the scan's workers, one per core. A worker that
+/// runs out of work waits; meanwhile the busy workers see that someone is waiting
+/// (`wantsWork`) and hand over the next subfolder they come to instead of reading it themselves.
+/// So the work splits itself up only as much as needed, and every core stays busy until the end,
+/// however lopsided the folders are.
+final class WorkQueue: @unchecked Sendable {
+    struct Job {
+        let id: Int
+        let folder: CloudFolder
+    }
+
+    private let condition = NSCondition()
+    private var jobs: [Job] = []
+    private var waiting = 0
+    private var busy = 0
+    private var stopped = false
+    private var nextID = 0
+
+    init(_ folders: [CloudFolder]) {
+        jobs = folders.reversed().map { folder in
+            defer { nextID += 1 }
+            return Job(id: nextID, folder: folder)
+        }
+    }
+
+    /// The next folder to read; nil once every folder is read (or the queue was stopped).
+    /// The caller must call `finished()` after reading it.
+    func next() -> Job? {
+        condition.lock()
+        defer { condition.unlock() }
+        while true {
+            if stopped { return nil }
+            if let job = jobs.popLast() {
+                busy += 1
+                return job
+            }
+            if busy == 0 {
+                condition.broadcast()
+                return nil
+            }
+            waiting += 1
+            condition.wait()
+            waiting -= 1
+        }
+    }
+
+    func finished() {
+        condition.lock()
+        busy -= 1
+        if busy == 0 && jobs.isEmpty { condition.broadcast() }
+        condition.unlock()
+    }
+
+    /// True when a worker is idle and nothing is queued: hand it the next subfolder.
+    var wantsWork: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return waiting > 0 && jobs.isEmpty && !stopped
+    }
+
+    /// Queues a folder (part of one being read) for an idle worker; returns its id.
+    @discardableResult
+    func add(_ folder: CloudFolder) -> Int {
+        condition.lock()
+        let id = nextID
+        nextID += 1
+        jobs.append(Job(id: id, folder: folder))
+        condition.signal()
+        condition.unlock()
+        return id
+    }
+
+    func stop() {
+        condition.lock()
+        stopped = true
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
+/// Finished pieces waiting for the main thread to add them to the tree.
+final class ScanInbox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pieces: [ScanPiece] = []
+
+    func add(_ piece: ScanPiece) {
+        lock.lock()
+        pieces.append(piece)
+        lock.unlock()
+    }
+
+    func takeAll() -> [ScanPiece] {
+        lock.lock()
+        defer { lock.unlock() }
+        let taken = pieces
+        pieces = []
+        return taken
     }
 }
 
@@ -236,6 +435,10 @@ enum FolderReader {
     /// `uncounted` is the folder's `Node.uncountedLinks`, so hard links come out exactly as the
     /// scan counted them: the folder's counted files add up to its `own` totals.
     static func files(in path: String, uncounted: [FileKey: Int]?) -> [FolderFile]? {
+        CloudFiles.withoutFetching { readFiles(in: path, uncounted: uncounted) }
+    }
+
+    private static func readFiles(in path: String, uncounted: [FileKey: Int]?) -> [FolderFile]? {
         guard let dir = opendir(path) else { return nil }
         defer { closedir(dir) }
         let fd = dirfd(dir)

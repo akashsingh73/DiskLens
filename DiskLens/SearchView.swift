@@ -55,7 +55,7 @@ final class SearchModel: ObservableObject {
 
     /// ⌘F: opens the panel, or puts the cursor back in its field.
     func show() {
-        guard let app, app.result != nil, !app.isScanning else {
+        guard let app, app.result != nil, !app.isReadingTree else {
             NSSound.beep()
             return
         }
@@ -98,7 +98,7 @@ final class SearchModel: ObservableObject {
     /// Searches again if the text, the scan or the size mode changed since the results shown were
     /// found, or if reading folders for files was stopped before it finished.
     func refresh(debounce: Bool) {
-        guard isPresented, let app, let result = app.result, !app.isScanning else {
+        guard isPresented, let app, let result = app.result, !app.isReadingTree else {
             stop()
             return
         }
@@ -269,7 +269,7 @@ struct SearchButton: View {
     @StateObject private var hover = HoverState()
 
     var body: some View {
-        let enabled = model.result != nil && !model.isScanning
+        let enabled = model.result != nil && !model.isReadingTree
         let shape = RoundedRectangle(cornerRadius: 7, style: .continuous)
         Button {
             search.show()

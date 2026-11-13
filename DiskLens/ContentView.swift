@@ -69,7 +69,7 @@ struct ContentView: View {
         }
         .navigationTitle(model.result?.displayName ?? "DiskLens")
         .modifier(ScanDropTarget(model: model))
-        .alert("Couldn't scan", isPresented: $model.showingError) {
+        .alert(model.errorTitle, isPresented: $model.showingError) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(model.errorText)
@@ -84,16 +84,26 @@ struct ContentView: View {
 
     // MARK: Sidebar
 
+    /// The scan to show: the finished one, or the one being read once its tree has arrived.
+    private var shownScan: ScanResult? {
+        model.isScanning && !model.isShowingLiveScan ? nil : model.result
+    }
+
     @ViewBuilder
     private func sidebar(_ settings: DisplaySettings) -> some View {
-        let scanned = model.isScanning ? nil : model.result
+        let scanned = shownScan
         VStack(spacing: 0) {
             if !model.fullDiskAccess || scanned != nil {
                 VStack(spacing: 10) {
                     if !model.fullDiskAccess { FullDiskAccessBanner(model: model) }
                     if let scanned {
                         SummaryCard(result: scanned, settings: settings, volume: model.volumeInfo,
-                                    changes: model.changes) {
+                                    changes: model.changes,
+                                    scanStatus: model.isShowingLiveScan ? model.status : nil,
+                                    cloud: model.cloudStatus,
+                                    stopScan: { model.cancel() },
+                                    readCloud: { model.readCloudFolders() },
+                                    stopCloud: { model.stopReadingCloud() }) {
                             model.showingUnreadable = true
                         } showChanges: {
                             tab = .history
@@ -116,9 +126,7 @@ struct ContentView: View {
 
     @ViewBuilder
     private func detail(_ settings: DisplaySettings) -> some View {
-        if model.isScanning {
-            ScanProgressPanel(status: model.status, name: model.scanningName) { model.cancel() }
-        } else if let result = model.result {
+        if let result = shownScan {
             let node = model.selection ?? result.root
             VStack(spacing: 0) {
                 PathBar(node: node, settings: settings) { model.navigate(to: $0) }
@@ -154,6 +162,8 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+        } else if model.isScanning {
+            ScanProgressPanel(status: model.status, name: model.scanningName) { model.cancel() }
         } else {
             WelcomePanel(model: model)
         }
@@ -329,6 +339,13 @@ struct SummaryCard: View {
     let volume: AppModel.VolumeInfo?
     /// What changed since an earlier scan of the same folder, if there was one.
     let changes: FolderComparison?
+    /// Set while this scan is still being read.
+    let scanStatus: ScanStatus?
+    /// Set while folders only in the cloud are being read after the scan.
+    let cloud: AppModel.CloudStatus?
+    let stopScan: @MainActor () -> Void
+    let readCloud: @MainActor () -> Void
+    let stopCloud: @MainActor () -> Void
     let showUnreadable: @MainActor () -> Void
     let showChanges: @MainActor () -> Void
 
@@ -342,9 +359,9 @@ struct SummaryCard: View {
                         .font(.headline)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text("Scanned in \(String(format: "%.1f", result.duration)) s")
+                    subtitle
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
             }
 
@@ -373,6 +390,12 @@ struct SummaryCard: View {
                 .help("Show which folders grew or shrank since the scan of \(changes.base.date.formatted(date: .abbreviated, time: .shortened))")
             }
 
+            if let scanStatus {
+                LiveScanStrip(status: scanStatus, rootPath: result.rootPath, stop: stopScan)
+            } else if let cloud {
+                CloudStrip(status: cloud, rootPath: result.rootPath, stop: stopCloud)
+            }
+
             if let volume, volume.total > 0 {
                 capacity(volume, scanned: root.allocated)
             }
@@ -382,12 +405,28 @@ struct SummaryCard: View {
                 VStack(alignment: .leading, spacing: 6) { chips(root) }
             }
 
-            if result.unreadableFolders > 0 || result.otherVolumeFolders > 0 || result.hardLinkDuplicates > 0 {
+            if hasNotes {
                 Divider()
                 notes
             }
         }
         .card()
+    }
+
+    @ViewBuilder
+    private var subtitle: some View {
+        if scanStatus != nil {
+            Text("Scanning…").foregroundStyle(.secondary)
+        } else if !result.isComplete {
+            Text("Stopped early: totals are incomplete").foregroundStyle(.orange)
+        } else {
+            Text("Scanned in \(String(format: "%.1f", result.duration)) s").foregroundStyle(.secondary)
+        }
+    }
+
+    private var hasNotes: Bool {
+        result.unreadableFolders > 0 || result.otherVolumeFolders > 0 || result.hardLinkDuplicates > 0
+            || (scanStatus == nil && cloud == nil && result.cloudOnlyFolders > 0)
     }
 
     @ViewBuilder
@@ -445,6 +484,18 @@ struct SummaryCard: View {
             if result.hardLinkDuplicates > 0 {
                 note("\(SizeFormat.count(result.hardLinkDuplicates, "extra hard link")) counted once", systemImage: "link")
             }
+            if scanStatus == nil && cloud == nil && result.cloudOnlyFolders > 0 {
+                HStack(spacing: 6) {
+                    Image(systemName: "icloud").foregroundStyle(.secondary)
+                    Text("\(SizeFormat.count(result.cloudOnlyFolders, "folder")) in the cloud not read")
+                        .foregroundStyle(.secondary)
+                    if result.isComplete {
+                        Button("Read Now", action: readCloud)
+                            .buttonStyle(.link)
+                            .help("Fetch these folders from the cloud and add them. They take no space on this Mac until downloaded.")
+                    }
+                }
+            }
         }
         .font(.caption)
         .lineLimit(1)
@@ -462,6 +513,112 @@ struct SummaryCard: View {
         if path == "/" || path == "/System/Volumes/Data" { return true }
         let components = (path as NSString).pathComponents
         return components.count == 3 && components[1] == "Volumes"
+    }
+}
+
+/// A path inside a scan, shown relative to the scanned folder ("Library › Caches").
+func pathInsideScan(_ path: String, root: String) -> String {
+    let prefix = root.hasSuffix("/") ? root : root + "/"
+    guard path.hasPrefix(prefix) else { return PathDisplay.friendly(path) }
+    return path.dropFirst(prefix.count).split(separator: "/").joined(separator: " › ")
+}
+
+/// In the summary card while a scan is still being read: how far it got, which folders it is
+/// on (the slow ones stay at the top), and Stop. Redraws on its own, four times a second.
+struct LiveScanStrip: View {
+    @ObservedObject var status: ScanStatus
+    let rootPath: String
+    let stop: @MainActor () -> Void
+
+    var body: some View {
+        let snapshot = status.snapshot
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                if snapshot.phase == .reading, let fraction = status.fraction {
+                    ProgressView(value: fraction)
+                } else {
+                    ProgressView().progressViewStyle(.linear)
+                }
+                Button(action: stop) {
+                    Label("Stop", systemImage: "stop.fill").labelStyle(.iconOnly)
+                }
+                .buttonStyle(.borderless)
+                .help("Stop the scan (⌘.). What was read so far stays.")
+            }
+            HStack(spacing: 4) {
+                Text(phaseText(snapshot))
+                Spacer(minLength: 4)
+                Text(elapsedText).monospacedDigit()
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            ForEach(Array(snapshot.reading.prefix(2).enumerated()), id: \.offset) { _, path in
+                Label {
+                    Text(pathInsideScan(path, root: rootPath))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                } icon: {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help(PathDisplay.friendly(path))
+            }
+        }
+    }
+
+    private func phaseText(_ snapshot: ScanProgress.Snapshot) -> String {
+        switch snapshot.phase {
+        case .listing: return "Listing folders…"
+        case .reading:
+            let files = SizeFormat.count(snapshot.files, "file")
+            if let fraction = status.fraction { return "About \(Int(fraction * 100)) % · \(files)" }
+            return "\(files) read"
+        case .finishing: return "Finishing up…"
+        }
+    }
+
+    private var elapsedText: String {
+        let seconds = max(0, Int(status.elapsed))
+        return String(format: "%ld:%02ld", seconds / 60, seconds % 60)
+    }
+}
+
+/// In the summary card while folders only in the cloud are being read after a scan.
+struct CloudStrip: View {
+    let status: AppModel.CloudStatus
+    let rootPath: String
+    let stop: @MainActor () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "icloud.and.arrow.down").foregroundStyle(.tint)
+                Text("Reading folders from the cloud")
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Button("Stop", action: stop)
+                    .buttonStyle(.link)
+                    .font(.caption)
+                    .help("Stop reading cloud folders. What arrived so far stays.")
+            }
+            ProgressView(value: Double(status.done), total: Double(max(1, status.total)))
+            Text("\(SizeFormat.count(status.done)) of \(SizeFormat.count(status.total, "folder")) · they fill in as they arrive")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            if let current = status.reading.first {
+                Text(pathInsideScan(current, root: rootPath))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(PathDisplay.friendly(current))
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.accentColor.opacity(0.08)))
     }
 }
 
@@ -609,9 +766,14 @@ struct ScanProgressPanel: View {
                     .foregroundStyle(.secondary)
             }
 
-            ProgressView()
-                .progressViewStyle(.linear)
-                .frame(maxWidth: 380)
+            Group {
+                if let fraction = status.fraction {
+                    ProgressView(value: fraction)
+                } else {
+                    ProgressView().progressViewStyle(.linear)
+                }
+            }
+            .frame(maxWidth: 380)
 
             HStack(spacing: 12) {
                 StatTile(value: SizeFormat.count(snapshot.files), label: "Files", systemImage: "doc")

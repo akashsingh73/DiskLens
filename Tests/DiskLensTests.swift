@@ -18,6 +18,7 @@ struct DiskLensTests {
             let fixture = try Fixture()
             defer { fixture.remove() }
             fixtureTests(fixture, checks)
+            streamingTests(fixture, checks)
         } catch {
             checks.fail("Couldn't build the test folder: \(error)")
         }
@@ -28,6 +29,101 @@ struct DiskLensTests {
               ? "All \(checks.passed) checks passed."
               : "\(checks.failed) of \(checks.passed + checks.failed) checks FAILED.")
         exit(checks.failed == 0 ? 0 : 1)
+    }
+
+    // MARK: - The tree arriving in pieces, and cloud folders
+
+    @MainActor
+    static func streamingTests(_ f: Fixture, _ c: Checks) {
+        c.section("Showing the tree while it is read")
+        var stat = Darwin.stat()
+        stat.st_flags = UInt32(SF_DATALESS)
+        c.expect(FileFacts(stat).isDataless, "a folder flagged dataless is only in the cloud")
+        stat.st_flags = 0
+        c.expect(!FileFacts(stat).isDataless, "an ordinary folder is not")
+        c.expect(CloudFiles.isCloudOnly(errorCode: EDEADLK), "EDEADLK means only in the cloud")
+        c.expect(!CloudFiles.isCloudOnly(errorCode: EACCES), "EACCES means no access, not cloud")
+
+        guard case .finished(let whole) = ScanEngine.scan(path: f.root, displayName: "Fixture", topCount: 10,
+                                                          progress: ScanProgress()) else {
+            c.fail("the one-shot scan didn't finish")
+            return
+        }
+        let inbox = ScanInbox()
+        var shownBeforePieces = false
+        var pendingAtShow = 0
+        var shown: ScanResult?
+        let outcome = ScanEngine.stream(path: f.root, displayName: "Fixture", topCount: 10, progress: ScanProgress(),
+                                        showTree: { tree in
+            shown = tree
+            shownBeforePieces = inbox.takeAll().isEmpty
+            var stack = [tree.root]
+            while let node = stack.popLast() {
+                if node.pending { pendingAtShow += 1 }
+                stack.append(contentsOf: node.children)
+            }
+        }, deliver: { inbox.add($0) })
+        guard case .finished(let live) = outcome, let tree = shown, tree === live else {
+            c.fail("the streaming scan didn't finish with the tree it showed")
+            return
+        }
+        c.expect(shownBeforePieces, "the tree is shown before any folder below it is delivered")
+        c.expect(pendingAtShow > 0, "folders below the first two levels start out as still reading")
+        let pieces = inbox.takeAll()
+        c.expect(pieces.count >= pendingAtShow, "a piece arrives for each folder still being read (plus any handed to idle workers)")
+        live.fillIn(pieces)
+        c.equal(live.piecesWaiting, 0, "no piece is left waiting")
+        var stillPending = 0
+        var stack = [live.root]
+        while let node = stack.popLast() {
+            if node.pending { stillPending += 1 }
+            stack.append(contentsOf: node.children)
+        }
+        c.equal(stillPending, 0, "every folder is filled in at the end")
+        c.equal(live.root.allocated, whole.root.allocated, "filled in piece by piece: same space on disk")
+        c.equal(live.root.size, whole.root.size, "same size")
+        c.equal(live.root.fileCount, whole.root.fileCount, "same files")
+        c.equal(live.root.folderCount, whole.root.folderCount, "same folders")
+        c.equal(live.root.unreadableCount, whole.root.unreadableCount, "same unreadable folders")
+        c.equal(live.extensions, whole.extensions, "same file types")
+        c.equal(live.ageCounts, whole.ageCounts, "same ages")
+        c.equal(live.topFiles.map(\.path), whole.topFiles.map(\.path), "same largest files")
+        c.equal(live.hardLinkDuplicates, whole.hardLinkDuplicates, "same extra hard links")
+
+        c.section("Reading a cloud folder after the scan")
+        // Turn folder "big" into a placeholder the way a folder only in the cloud looks after a scan,
+        // then read it the way DiskLens reads cloud folders, and check it fills back in. ("big" has
+        // no hard links: a real cloud folder was never read before, so none of its links were seen.)
+        guard let a = whole.root.descendant(atPath: f.root + "/big") else {
+            c.fail("folder big missing")
+            return
+        }
+        let full = (allocated: whole.root.allocated, files: whole.root.fileCount, folders: whole.root.folderCount)
+        let empty = Node(name: "big", parent: nil)
+        empty.cloudOnly = true
+        a.adopt(contentsOf: empty)
+        whole.cloudOnlyFolders += 1
+        c.expect(a.cloudOnly && a.ownFileCount == 0, "a placeholder holds nothing yet")
+        c.expect(whole.root.allocated < full.allocated, "and the totals leave it out")
+        let cloudInbox = ScanInbox()
+        ScanEngine.readCloudFolders([CloudFolder(path: f.root + "/big", name: "big", node: a)],
+                                    rootDevice: whole.rootDevice, links: HardLinkRegistry(), topCount: 10,
+                                    now: whole.scanTime, progress: ScanProgress(), deliver: { cloudInbox.add($0) })
+        for piece in cloudInbox.takeAll() { whole.fillIn(piece) }
+        c.expect(!a.cloudOnly, "once read, the folder is no longer marked as in the cloud")
+        c.equal(whole.cloudOnlyFolders, 0, "and isn't counted as unread")
+        c.equal(whole.root.allocated, full.allocated, "the totals are whole again")
+        c.equal(whole.root.fileCount, full.files, "files too")
+        c.equal(whole.root.folderCount, full.folders, "and folders")
+        c.equal(a.ownFileCount, 2, "its files are back")
+
+        let stopped = ScanProgress()
+        stopped.cancel()
+        let stoppedInbox = ScanInbox()
+        ScanEngine.readCloudFolders([CloudFolder(path: f.root + "/big", name: "big", node: a)],
+                                    rootDevice: whole.rootDevice, links: HardLinkRegistry(), topCount: 10,
+                                    now: whole.scanTime, progress: stopped, deliver: { stoppedInbox.add($0) })
+        c.expect(stoppedInbox.takeAll().isEmpty, "stopping before a cloud folder is read delivers nothing")
     }
 
     // MARK: - Small pieces
