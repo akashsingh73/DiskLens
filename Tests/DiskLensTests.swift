@@ -90,6 +90,89 @@ struct DiskLensTests {
         } else {
             c.fail("scanning a missing folder should fail")
         }
+
+        searchUnitTests(c)
+    }
+
+    @MainActor
+    static func searchUnitTests(_ c: Checks) {
+        c.section("Search: matching names")
+        let matches = { (query: String, name: String) in SearchQuery(query).matches(name) }
+        c.expect(matches("cache", "Caches"), "case doesn't matter")
+        c.expect(matches("CACHE", "app cache.db"), "upper-case query, lower-case name")
+        c.expect(matches("resume", "Résumé.pdf"), "accents don't matter")
+        c.expect(matches("résumé", "Re\u{301}sume\u{301}.pdf"), "a decomposed name (as some disks store it) matches")
+        c.expect(matches("RÉSUMÉ", "resume.txt"), "an accented query matches a plain name")
+        c.expect(matches("photo 2023", "2023 Holiday Photos"), "every word, in any order")
+        c.expect(!matches("photo 2024", "2023 Holiday Photos"), "every word must appear")
+        c.expect(matches(".dmg", "Installer.DMG"), "an extension")
+        c.expect(!matches(".dmg", "dmg-notes.txt"), "an extension needs its dot")
+        c.expect(matches("写真", "2023 写真"), "names that aren't in Latin letters")
+        c.expect(matches("ｆｉｌｅ", "File.txt"), "full-width letters")
+        c.expect(matches("strasse", "Straße"), "ß and ss")
+        c.expect(matches("a", "A"), "a single letter")
+        c.expect(!matches("abc", "ab"), "a word longer than the name")
+        c.expect(!matches("", "anything"), "an empty query matches nothing")
+        c.expect(SearchQuery(" \t ").isEmpty, "spaces only is an empty query")
+        c.equal(SearchQuery("  two   words ").words, ["two", "words"], "the words as typed")
+        let bytes = Array("Library".utf8)
+        c.expect(bytes.withUnsafeBytes { SearchQuery("BRAR").matches(utf8: $0) }, "names straight from readdir")
+
+        c.section("Search: ranking")
+        func hit(_ name: String, _ allocated: Int64, size: Int64? = nil, kind: SearchHit.Kind = .file,
+                 folder: Int32 = 1, path: String? = nil) -> SearchHit {
+            SearchHit(kind: kind, name: name, folder: folder, size: size ?? allocated, allocated: allocated,
+                      path: path ?? "/scan/\(name)")
+        }
+        var largest = LargestHits(capacity: 10, bySize: false)
+        for i in (1...1000).shuffled() { largest.add(hit("f\(i)", Int64(i))) }
+        c.equal(largest.matched, 1000, "every match is counted")
+        c.equal(largest.sorted().map(\.allocated), (991...1000).reversed().map { Int64($0) }, "keeps the 10 largest, largest first")
+        c.expect(!largest.wants(990) && largest.wants(1000), "knows which sizes it would keep")
+        var ties = LargestHits(capacity: 5, bySize: false)
+        ties.add(hit("b", 5))
+        ties.add(hit("a", 5))
+        ties.add(hit("z", 5, kind: .folder, folder: 3))
+        c.equal(ties.sorted().map(\.name), ["z", "a", "b"], "equal sizes: folders first, then by name")
+        var bySize = LargestHits(capacity: 2, bySize: true)
+        bySize.add(hit("sparse", 1, size: 1000))
+        bySize.add(hit("dense", 500))
+        bySize.add(hit("small", 10))
+        c.equal(bySize.sorted().map(\.name), ["sparse", "dense"], "the Size mode ranks by size, not space on disk")
+        var first = LargestHits(capacity: 3, bySize: false)
+        var second = LargestHits(capacity: 3, bySize: false)
+        for i in 1...5 { first.add(hit("p\(i)", Int64(i))) }
+        for i in 6...9 { second.add(hit("q\(i)", Int64(i * 10))) }
+        first.merge(second)
+        c.equal(first.matched, 9, "merging adds the counts")
+        c.equal(first.sorted().map(\.name), ["q9", "q8", "q7"], "and keeps the largest of both")
+        var none = LargestHits(capacity: 0, bySize: false)
+        none.add(hit("x", 1))
+        c.expect(none.heap.isEmpty && none.matched == 1, "a capacity of 0 only counts")
+
+        var topFiles = LargestHits(capacity: 10, bySize: false)
+        topFiles.add(hit("big.iso", 900, folder: -1, path: "/scan/a/big.iso"))
+        var read = LargestHits(capacity: 10, bySize: false)
+        read.add(hit("big.iso", 900, folder: 4, path: "/scan/a/big.iso"))
+        read.add(hit("small.iso", 5, folder: 4, path: "/scan/a/small.iso"))
+        var folders = LargestHits(capacity: 10, bySize: false)
+        folders.add(hit("isos", 1000, kind: .folder, folder: 2, path: "/scan/isos"))
+        let merged = ScanSearch.merge(folders: folders, files: [read, topFiles], bySize: false)
+        c.equal(merged.map(\.name), ["isos", "big.iso", "small.iso"], "folders and files in one list, largest first")
+        c.equal(merged.first { $0.name == "big.iso" }?.folder, 4, "a Top File found again is listed once")
+        c.equal(ScanSearch.merge(folders: folders, files: [read, topFiles], bySize: false, limit: 2).count, 2, "the list is capped")
+
+        c.section("Search: where results are")
+        c.equal(SearchIndex.describe([String](), rootName: "Home"), "Home", "the top of the scan")
+        c.equal(SearchIndex.describe(["Library"], rootName: "Home"), "Library", "one folder down")
+        c.equal(SearchIndex.describe(["Library", "Caches"], rootName: "Home"), "Library › Caches", "two folders down")
+        c.equal(SearchIndex.describe(["Library", "Caches", "com.example", "Cache"], rootName: "Home"),
+                "Library › … › Cache", "deeper: first and last folder")
+        c.equal(SearchIndex.components(of: "/Users/me/Library/Caches", below: "/Users/me"), ["Library", "Caches"], "folders below the root")
+        c.equal(SearchIndex.components(of: "/Users/me", below: "/Users/me"), [], "the root itself")
+        c.equal(SearchIndex.components(of: "/Volumes/X/a", below: "/"), ["Volumes", "X", "a"], "below /")
+        c.equal(SearchIndex.join("/", ["a", "b"]), "/a/b", "joining onto /")
+        c.equal(SearchIndex.join("/scan", []), "/scan", "joining nothing")
     }
 
     // MARK: - The test folder
@@ -177,6 +260,8 @@ struct DiskLensTests {
             }
         }
 
+        searchFixtureTests(f, result, c)
+
         c.section("Moving to the Trash (File Types and Ages)")
         let all = FileTally.read(FileTally.folders(in: root, path: f.root), now: result.scanTime, progress: ScanProgress())
         c.equal(all.extensions, result.extensions, "reading every folder again gives the scan's File Types")
@@ -218,6 +303,73 @@ struct DiskLensTests {
         } else {
             c.fail("old/old.log missing")
         }
+    }
+
+    @MainActor
+    static func searchFixtureTests(_ f: Fixture, _ result: ScanResult, _ c: Checks) {
+        c.section("Search (the test folder)")
+        let root = result.root
+        let node = { (relative: String) in root.descendant(atPath: f.root + "/" + relative) }
+        let built = SearchIndex.build(root: root, rootPath: f.root, rootName: "Fixture", topFiles: result.topFiles)
+        let index = built.index
+        c.equal(index.count, f.folders + 1, "the index has every folder and the root")
+        c.equal(built.nodes.count, index.count, "and each folder's node")
+        c.expect(built.nodes.indices.allSatisfy { index.path(of: Int32($0)) == built.nodes[$0].path },
+                 "index paths match the tree")
+
+        let bFolders = ScanSearch.folders(in: index, matching: SearchQuery("B"), bySize: false).sorted()
+        c.equal(bFolders.map(\.name), ["big", "b"], "folders by name, largest first")
+        c.equal(bFolders.map(\.path), [f.root + "/big", f.root + "/a/b"], "with their paths")
+        c.equal(bFolders.last.map { index.location(of: $0) }, "a", "and where they are")
+        c.equal(ScanSearch.folders(in: index, matching: SearchQuery("locked"), bySize: false).matched, 2,
+                "unreadable folders are found by name too")
+        c.equal(ScanSearch.folders(in: index, matching: SearchQuery("fixture"), bySize: false).matched, 0,
+                "the scan's root is not a result")
+        let top = ScanSearch.topFiles(in: index, matching: SearchQuery("BIG.dat"), bySize: false).sorted()
+        c.equal(top.map(\.name), ["big.dat"], "Top Files are searched without reading folders")
+        c.equal(top.first.map { index.location(of: $0) }, "big", "and know where they are")
+
+        func files(_ text: String, limit: Int = ScanSearch.limit) -> FileSearch.Snapshot {
+            let search = FileSearch(index: index, query: SearchQuery(text), bySize: false, limit: limit)
+            search.run()
+            return search.snapshot()
+        }
+        let deep = files("deep")
+        c.expect(deep.finished, "reading folders finishes")
+        c.equal(deep.foldersRead, deep.foldersTotal, "and reads every folder with files")
+        c.equal(Set(deep.found.heap.map(\.name)), ["deep.dat", "deep-link.bin"], "files in deep folders")
+        c.equal(deep.found.heap.first.map { index.location(of: $0) }, "a › … › e", "and where they are")
+        c.equal(files("dat").found.sorted().map(\.name), ["big.dat", "top.dat", "deep.dat"], "files largest first")
+        c.equal(files("THREE").found.heap.map(\.name), ["three.TXT"], "case doesn't matter for files")
+        if let big = node("big"), let file = FolderReader.files(in: big.path, uncounted: nil)?.first(where: { $0.name == "big.dat" }) {
+            c.equal(files("big.dat").found.heap.first?.allocated, file.facts.allocated, "a file's space on disk")
+        } else {
+            c.fail("big/big.dat missing")
+        }
+        let one = files("one")
+        c.equal(Set(one.found.heap.map(\.name)), ["one.txt", "one-again.txt"], "both hard links in one folder")
+        c.equal(one.found.heap.filter { !$0.counted }.count, 1, "one of them is counted elsewhere")
+        c.equal(one.found.heap.reduce(0) { $0 + $1.allocated }, node("a")?.ownAllocated, "together they take what the folder's files take")
+        let bins = files(".bin")
+        c.equal(bins.found.matched, 3, "three links to one file in three folders")
+        c.equal(bins.found.heap.filter(\.counted).count, 1, "counted once, as in the scan")
+        c.equal(files("link-to").found.matched, 2, "symbolic links are files (and aren't followed)")
+        c.equal(files("secret").found.matched, 0, "files in unreadable folders aren't found")
+        let dots = files(".")
+        c.equal(dots.found.matched, 13, "every readable file with a dot, without . and .. or folders")
+        c.expect(dots.found.heap.allSatisfy { $0.kind == .file && $0.name != "." && $0.name != ".." }, "only files")
+        let capped = files(".", limit: 2)
+        c.expect(capped.found.heap.count == 2 && capped.found.matched == 13, "keeps only the largest, counts all")
+        let stopped = FileSearch(index: index, query: SearchQuery("dat"), bySize: false)
+        stopped.cancel()
+        stopped.run()
+        c.expect(!stopped.snapshot().finished && stopped.snapshot().found.matched == 0, "a cancelled search reads nothing")
+
+        let bigFolders = ScanSearch.folders(in: index, matching: SearchQuery("big"), bySize: false)
+        let bigTop = ScanSearch.topFiles(in: index, matching: SearchQuery("big"), bySize: false)
+        let merged = ScanSearch.merge(folders: bigFolders, files: [files("big").found, bigTop], bySize: false)
+        c.equal(merged.filter { $0.name == "big.dat" }.count, 1, "a Top File found again is listed once")
+        c.equal(merged.first?.path, f.root + "/big", "the folder holding it comes first (it's at least as large)")
     }
 
     // MARK: - Real folders

@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// The bar across the top of the window: scanning, Back / Forward / Up, and how sizes are shown.
+/// The bar across the top of the window: scanning, Back / Forward / Up, how sizes are shown, and search.
 /// It is ordinary window content rather than a SwiftUI toolbar: toolbar items that change size
 /// can send SwiftUI and AppKit into an endless layout loop, which is what crashed version 1.0.
 struct CommandBar: View {
@@ -88,6 +88,8 @@ struct CommandBar: View {
             .labelsHidden()
             .fixedSize()
             .help("Size unit")
+
+            SearchButton(model: model, search: model.search)
         }
         .padding(.horizontal, 10)
         .frame(height: 40)

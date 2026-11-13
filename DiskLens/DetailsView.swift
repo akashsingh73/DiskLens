@@ -154,9 +154,22 @@ struct DetailsView: View {
         .task(id: LoadKey(node: node.id, version: model.version)) {
             await reload()
         }
+        .onChange(of: model.fileToHighlight) { showPendingFile() }
     }
 
     private var table: some View {
+        ScrollViewReader { proxy in
+            rowsTable
+                .onChange(of: state.scrollTarget) {
+                    guard let target = state.scrollTarget else { return }
+                    // Centred vertically, at the leading edge horizontally, so the Name column stays in view.
+                    proxy.scrollTo(target, anchor: UnitPoint(x: 0, y: 0.5))
+                    state.scrollTarget = nil
+                }
+        }
+    }
+
+    private var rowsTable: some View {
         Table(state.rows, selection: $state.selection, sortOrder: $state.sortOrder,
               columnCustomization: $state.columns) {
             TableColumn("Name", value: \.name) { item in
@@ -277,9 +290,21 @@ struct DetailsView: View {
         }
     }
 
+    /// Selects the file a search result asked for, once this folder's files are listed.
+    private func showPendingFile() {
+        guard let target = model.fileToHighlight,
+              state.listedFolder == (target as NSString).deletingLastPathComponent else { return }
+        if state.rows.contains(where: { $0.id == target }) {
+            state.selection = [target]
+            state.scrollTarget = target
+        }
+        model.fileHighlightHandled()
+    }
+
     private func reload() async {
         let directory = node.directory
         let path = directory.path
+        state.listedFolder = nil
         let total = directory.allocated
         let uncounted = directory.uncountedLinks
         var folderRows: [DetailItem] = []
@@ -312,6 +337,8 @@ struct DetailsView: View {
         }
         guard directory.ownFileCount > 0, !directory.unreadable else {
             state.loading = false
+            state.listedFolder = path
+            showPendingFile()
             return
         }
         state.loading = true
@@ -326,6 +353,8 @@ struct DetailsView: View {
         state.totalFiles = listing.total
         state.hiddenFiles = max(0, listing.total - listing.items.count)
         state.loading = false
+        state.listedFolder = path
+        showPendingFile()
     }
 }
 
@@ -378,6 +407,10 @@ final class DetailsState: ObservableObject {
     }
     @Published var columns = TableColumnCustomization<DetailItem>()
     @Published var previewURL: URL?
+    /// A row to scroll to (a file chosen in search).
+    @Published var scrollTarget: DetailItem.ID?
+    /// The folder whose files are fully listed in `rows`, nil while they are being read.
+    var listedFolder: String?
     @Published var loading = false
     @Published var totalFiles = 0
     @Published var hiddenFiles = 0

@@ -36,8 +36,15 @@ final class AppModel: ObservableObject {
     @Published var showingUnreadable = false
     /// The folder being moved to the Trash, while its files are counted for File Types and Ages.
     @Published private(set) var trashingName: String?
+    /// A file Details should select once it lists the folder being shown (a search result).
+    @Published private(set) var fileToHighlight: String?
 
     let status = ScanStatus()
+    let search = SearchModel()
+
+    init() {
+        search.app = self
+    }
 
     private var activeProgress: ScanProgress?
     private var pollTask: Task<Void, Never>?
@@ -69,6 +76,7 @@ final class AppModel: ObservableObject {
         let name = target.displayName
         let topCount = Prefs.topFilesCountValue
 
+        search.scanStarted()
         activeProgress = progress
         isScanning = true
         scanningName = name
@@ -156,9 +164,11 @@ final class AppModel: ObservableObject {
         }
 
         result = newResult
+        search.scanChanged()
         backStack.removeAll()
         forwardStack.removeAll()
         cameFrom = nil
+        fileHighlightHandled()
         if let keepPath, let node = root.descendant(atPath: keepPath) {
             selection = node
         } else {
@@ -207,9 +217,11 @@ final class AppModel: ObservableObject {
     var canGoUp: Bool { selection?.parent != nil }
 
     /// Shows a folder and remembers where the user came from, for Back.
-    /// `reveal` also expands the folder tree down to it.
-    func navigate(to node: Node, reveal: Bool = true) {
+    /// `reveal` also expands the folder tree down to it. `file` (a path in that folder) is selected
+    /// in Details once it lists the folder.
+    func navigate(to node: Node, reveal: Bool = true, highlightingFile file: String? = nil) {
         guard belongsToCurrentScan(node) else { return }
+        if fileToHighlight != file { fileToHighlight = file }
         if let current = selection, current !== node {
             cameFrom = current
             backStack.append(current)
@@ -224,6 +236,7 @@ final class AppModel: ObservableObject {
 
     func goBack() {
         guard let target = backStack.popLast() else { return }
+        fileHighlightHandled()
         cameFrom = selection
         if let current = selection { forwardStack.append(current) }
         selection = target
@@ -232,10 +245,16 @@ final class AppModel: ObservableObject {
 
     func goForward() {
         guard let target = forwardStack.popLast() else { return }
+        fileHighlightHandled()
         cameFrom = selection
         if let current = selection { backStack.append(current) }
         selection = target
         revealToken += 1
+    }
+
+    /// Details calls this once it has selected (or given up on) `fileToHighlight`.
+    func fileHighlightHandled() {
+        if fileToHighlight != nil { fileToHighlight = nil }
     }
 
     /// Goes to the folder that contains the current one.

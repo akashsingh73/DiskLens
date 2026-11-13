@@ -32,6 +32,11 @@ struct DiskLensApp: App {
                     .keyboardShortcut(".")
                     .disabled(!model.isScanning)
             }
+            CommandGroup(replacing: .textEditing) {
+                Button("Find…") { model.search.show() }
+                    .keyboardShortcut("f")
+                    .disabled(model.result == nil || model.isScanning)
+            }
             CommandGroup(before: .toolbar) {
                 ForEach(DetailTab.allCases) { option in
                     Button(option.rawValue) { tab = option }

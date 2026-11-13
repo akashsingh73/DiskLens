@@ -74,6 +74,9 @@ ad-hoc signature, so use `build.sh` for the copy you keep in Applications.
 - **File Types** by group and extension, **Top Files** (the 100 largest by default, each with the app or folder it
   lives in), **Ages** (by modification date, including how much hasn't changed in a year) and **History** (a point
   per scan, so you can watch a folder grow).
+- **Search** (⌘F): find folders and files by name anywhere in the scan, largest first, with where each one is.
+  Folders and Top Files show up as you type; other files turn up as DiskLens reads the scanned folders again in the
+  background (a scan keeps only folder totals, not every file). Choose a result to go there.
 - **Recent scans** on the start screen, to scan a folder again with one click.
 - **Clean up safely**: right-click anything to reveal it in Finder, open it, Quick Look it, copy its path, or move
   it to the Trash. DiskLens always asks first, never deletes outright, and refuses system folders and your home
@@ -90,6 +93,7 @@ ad-hoc signature, so use `build.sh` for the copy you keep in Applications.
 | Go back up | Click any folder in the path bar above the views, or press ⌘↑ |
 | Back / Forward | The arrow buttons at the top left, ⌘[ and ⌘], or the side buttons on your mouse |
 | Jump to the top of the scan | ⇧⌘↑ |
+| Find a folder or file by name | ⌘F (or click Search at the top right), type part of the name, then ↑↓ and Return to go there |
 | Switch views | ⌘1 Details, ⌘2 Treemap, ⌘3 Chart, ⌘4 File Types, ⌘5 Top Files, ⌘6 Ages, ⌘7 History |
 | Preview a file | Select it in Details and press Space |
 | Change units, bar colours, treemap detail | DiskLens ▸ Settings (⌘,) |
@@ -157,8 +161,9 @@ A few rules keep DiskLens stable; please keep to them:
 - **No SwiftUI macros** (`@State`, `@Observable`): the Command Line Tools don't include the plugin they need.
   View state lives in small `ObservableObject` classes instead.
 - **Threads**: the scan runs on background threads; everything on screen is updated on the main thread only.
-- **Big folders stay responsive**: Details lists at most the 50,000 largest files of a folder, and "Expand All
-  Below" stops after a few thousand folders.
+- **Big folders stay responsive**: Details lists at most the 50,000 largest files of a folder, "Expand All
+  Below" stops after a few thousand folders, and search keeps only the 500 largest matches and reads folders on
+  background threads, stopping as soon as the text changes.
 
 ### Project layout
 
@@ -169,7 +174,8 @@ A few rules keep DiskLens stable; please keep to them:
 | `DiskLens/ScanEngine.swift`, `Scanner.swift` | The scanner: reads the top two levels, then scans branches in parallel with `fts` |
 | `DiskLens/Node.swift`, `ScanTypes.swift` | The folder tree and scan statistics |
 | `DiskLens/TreeOutline.swift` | The folder tree with size bars (AppKit outline view) |
-| `DiskLens/Navigation.swift` | The command bar (scan, back, forward, up, size mode) and the clickable path bar |
+| `DiskLens/Navigation.swift` | The command bar (scan, back, forward, up, size mode, search) and the clickable path bar |
+| `DiskLens/Search.swift`, `SearchView.swift` | Search (⌘F): matching and ranking names, reading folders again for files; the search field and panel |
 | `DiskLens/DetailsView.swift`, `TreemapView.swift`, `ChartsView.swift`, `AnalysisViews.swift` | The views on the right |
 | `DiskLens/Settings.swift`, `SettingsView.swift` | Preferences and the Settings window |
 | `DiskLens/ContentView.swift`, `AppModel.swift`, `DiskLensApp.swift` | Window layout, tabs, summary card, start and scanning screens, navigation history, scan control, menus |
