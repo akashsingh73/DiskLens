@@ -78,6 +78,11 @@ ad-hoc signature, so use `build.sh` for the copy you keep in Applications.
   appeared, disappeared or were renamed, biggest change first. Details gets a Change column, and the summary card
   shows how much the whole folder changed. DiskLens compares the largest folders in the top four levels; a folder
   scanned before as part of a bigger scan is compared with that.
+- **Suggestions**: well-known places in the scan that often hold space you can get back, largest first: Xcode's
+  DerivedData, Archives, iOS Device Support and simulators, your Caches (and Homebrew's), every project's
+  `node_modules` (grouped, with a count), iPhone and iPad backups, Docker's data, and the Trash. Each says why it's
+  usually safe to remove, with buttons to reveal it in Finder, show it in DiskLens, or move it to the Trash.
+  `node_modules` folders inside apps, editor extensions, `Library` folders and other tools' folders are left out.
 - **Recent scans** on the start screen, to scan a folder again with one click.
 - **Clean up safely**: right-click anything to reveal it in Finder, open it, Quick Look it, copy its path, or move
   it to the Trash. DiskLens always asks first, never deletes outright, and refuses system folders and your home
@@ -94,7 +99,7 @@ ad-hoc signature, so use `build.sh` for the copy you keep in Applications.
 | Go back up | Click any folder in the path bar above the views, or press ⌘↑ |
 | Back / Forward | The arrow buttons at the top left, ⌘[ and ⌘], or the side buttons on your mouse |
 | Jump to the top of the scan | ⇧⌘↑ |
-| Switch views | ⌘1 Details, ⌘2 Treemap, ⌘3 Chart, ⌘4 File Types, ⌘5 Top Files, ⌘6 Ages, ⌘7 History |
+| Switch views | ⌘1 Details, ⌘2 Treemap, ⌘3 Chart, ⌘4 File Types, ⌘5 Top Files, ⌘6 Ages, ⌘7 History, ⌘8 Suggestions |
 | Preview a file | Select it in Details and press Space |
 | Change units, bar colours, treemap detail | DiskLens ▸ Settings (⌘,) |
 
@@ -177,6 +182,7 @@ A few rules keep DiskLens stable; please keep to them:
 | `DiskLens/TreeOutline.swift` | The folder tree with size bars (AppKit outline view) |
 | `DiskLens/Navigation.swift` | The command bar (scan, back, forward, up, size mode) and the clickable path bar |
 | `DiskLens/DetailsView.swift`, `TreemapView.swift`, `ChartsView.swift`, `AnalysisViews.swift` | The views on the right |
+| `DiskLens/Suggestions.swift` | The Suggestions view, and how it finds well-known reclaimable places in a scan |
 | `DiskLens/Settings.swift`, `SettingsView.swift` | Preferences and the Settings window |
 | `DiskLens/ContentView.swift`, `AppModel.swift`, `DiskLensApp.swift` | Window layout, tabs, summary card, start and scanning screens, navigation history, scan control, menus |
 | `DiskLens/Theme.swift` | The look: colour palette, cards, chips, icons for file types |

@@ -77,6 +77,8 @@ struct DiskLensTests {
             c.expect(!FileActions.isProtected(path), "\(path) should not be protected")
         }
 
+        suggestionTests(c)
+
         c.section("Scan failures")
         let cancelled = ScanProgress()
         cancelled.cancel()
@@ -364,6 +366,107 @@ struct DiskLensTests {
         }
     }
 
+    // MARK: - Suggestions
+
+    /// Finds well-known places in made-up trees (no files needed: suggestions come from the tree).
+    @MainActor
+    static func suggestionTests(_ c: Checks) {
+        let mb: Int64 = 1_000_000
+        let home = "/Users/test"
+        let homeFolders: [(String, Int64)] = [
+            ("Library/Developer/Xcode/DerivedData/App-abc/Build", 900 * mb),
+            ("Library/Developer/Xcode/Archives/2026-01-01", 300 * mb),
+            ("Library/Developer/Xcode/iOS DeviceSupport/18.0", 200 * mb),
+            ("Library/Developer/CoreSimulator/Devices/UUID-1", 700 * mb),
+            ("Library/Caches/com.example.app", 100 * mb),
+            ("Library/Caches/Homebrew/downloads", 400 * mb),
+            ("Library/Application Support/MobileSync/Backup/device-1", 800 * mb),
+            ("Library/Containers/com.docker.docker/Data", 1_000 * mb),
+            (".Trash/old-project/node_modules", 50 * mb),
+            ("Projects/web/node_modules/react", 120 * mb),
+            ("Projects/web/node_modules/react/node_modules/inner", 30 * mb),   // part of the outer one
+            ("Projects/web/src", 1 * mb),
+            ("Projects/mono/packages/ui/node_modules/x", 60 * mb),
+            ("Projects/empty/node_modules", 0),                                  // nothing to free
+            (".vscode/extensions/ext/node_modules/x", 70 * mb),                  // an editor extension
+            ("Library/Application Support/Code/node_modules/x", 80 * mb),        // app data
+            ("Applications/Tool.app/Contents/Resources/app/node_modules/x", 90 * mb),  // inside an app
+            ("Documents/notes", 5 * mb),
+        ]
+        let homeScan = SuggestionTree.make(rootPath: home, folders: homeFolders)
+        let found = Suggestions.find(in: homeScan, home: home)
+        let byKind = Dictionary(found.map { ($0.kind, $0) }, uniquingKeysWith: { first, _ in first })
+
+        c.section("Suggestions: a home folder scan")
+        c.equal(Set(found.map(\.kind)), Set(Suggestions.Kind.allCases), "finds every kind of place")
+        c.equal(found.map(\.allocated), found.map(\.allocated).sorted(by: >), "largest first")
+        c.equal(found.first?.kind, .docker, "the largest is Docker's data")
+        c.equal(byKind[.derivedData]?.nodes.first?.path, home + "/Library/Developer/Xcode/DerivedData", "DerivedData's path")
+        c.equal(byKind[.derivedData]?.allocated, 900 * mb, "DerivedData's size")
+        c.equal(byKind[.caches]?.allocated, 500 * mb, "Caches includes Homebrew's cache")
+        c.equal(byKind[.homebrew]?.allocated, 400 * mb, "Homebrew's cache on its own")
+        c.equal(byKind[.trash]?.allocated, 50 * mb, "the Trash")
+        c.expect(byKind[.trash]?.kind.canTrash == false, "the Trash itself is never moved to the Trash")
+        let packages = byKind[.nodeModules]
+        c.equal(packages?.nodes.map(\.path), [home + "/Projects/web/node_modules", home + "/Projects/mono/packages/ui/node_modules"],
+                "node_modules of projects only, outer ones only, largest first")
+        c.equal(packages?.allocated, 210 * mb, "node_modules total")
+        c.equal(Suggestions.total(of: found),
+                (900 + 300 + 200 + 700 + 500 + 800 + 1_000 + 50 + 210) * mb, "the total counts Homebrew's cache once")
+        for suggestion in found where suggestion.kind.canTrash {
+            for node in suggestion.nodes {
+                c.expect(node.parent != nil, "\(suggestion.kind) is below the scan's top folder")
+            }
+        }
+        for kind in Suggestions.Kind.allCases where kind.canTrash {
+            if let relative = kind.homePath {
+                c.expect(!FileActions.isProtected(NSHomeDirectory() + "/" + relative), "\(kind) can be moved to the Trash")
+            }
+        }
+
+        c.section("Suggestions: other scans")
+        let disk = SuggestionTree.make(rootPath: "/System/Volumes/Data", folders: [
+            ("Users/test/Library/Caches/x", 100 * mb),
+            ("Users/test/code/site/node_modules/x", 20 * mb),
+            ("Users/other/Library/Caches/x", 300 * mb),                          // another user's
+            ("usr/local/lib/node_modules/npm", 40 * mb),                         // global packages
+            ("opt/homebrew/lib/node_modules/x", 40 * mb),
+            ("Applications/Big.app/Contents/node_modules/x", 40 * mb),
+            ("private/var/folders/node_modules/x", 40 * mb),
+        ])
+        let diskFound = Suggestions.find(in: disk, home: home)
+        c.equal(diskFound.map(\.kind), [.caches, .nodeModules], "startup disk: the user's caches and project packages")
+        c.equal(diskFound.first?.nodes.first?.path, "/System/Volumes/Data/Users/test/Library/Caches",
+                "startup disk: found inside the data volume")
+        c.equal(diskFound.last?.nodes.map(\.path), ["/System/Volumes/Data/Users/test/code/site/node_modules"],
+                "startup disk: no node_modules of apps or command-line tools")
+
+        let library = SuggestionTree.make(rootPath: home + "/Library/Developer", folders: [
+            ("Xcode/DerivedData/x", 10 * mb), ("CoreSimulator/Devices/x", 10 * mb),
+        ])
+        c.equal(Set(Suggestions.find(in: library, home: home).map(\.kind)), [.derivedData, .simulators],
+                "a scan of ~/Library/Developer finds Xcode's folders only")
+        let caches = SuggestionTree.make(rootPath: home + "/Library/Caches", folders: [("Homebrew/x", 10 * mb), ("y", 5 * mb)])
+        c.equal(Suggestions.find(in: caches, home: home).map(\.kind), [.homebrew],
+                "a scan of ~/Library/Caches suggests what's inside it, not the scan itself")
+        let emptyTrash = SuggestionTree.make(rootPath: home, folders: [(".Trash", 0), ("Documents/a", 5 * mb)])
+        c.expect(Suggestions.find(in: emptyTrash, home: home).isEmpty, "an empty Trash isn't suggested")
+        let elsewhere = SuggestionTree.make(rootPath: "/Volumes/Work", folders: [("Library/Caches/x", 10 * mb), ("app/node_modules/x", 10 * mb)])
+        c.equal(Suggestions.find(in: elsewhere, home: home).map(\.kind), [.nodeModules], "another disk: node_modules only")
+        let extensions = SuggestionTree.make(rootPath: home + "/.vscode/extensions", folders: [("ext/node_modules/x", 10 * mb)])
+        c.expect(Suggestions.nodeModules(in: extensions).isEmpty, "a scan inside a hidden tool folder suggests no node_modules")
+
+        c.equal(Suggestions.candidatePaths("/Users/test/.Trash"), ["/Users/test/.Trash", "/System/Volumes/Data/Users/test/.Trash"],
+                "a path, and the same path on the data volume")
+        for path in ["/usr/local/lib", "/System/Volumes/Data/opt/homebrew", "/Applications/A.app/Contents", "/Users/test/Library/X",
+                     "/Users/test/.nvm/versions", "/Library"] {
+            c.expect(Suggestions.isToolPath(path), "\(path) holds tools, not projects")
+        }
+        for path in ["/", "/System/Volumes/Data", "/System/Volumes/Data/Users/test", "/Users/test/Projects", "/Volumes/Work/code"] {
+            c.expect(!Suggestions.isToolPath(path), "\(path) can hold projects")
+        }
+    }
+
     // MARK: - The test folder
 
     @MainActor
@@ -532,6 +635,37 @@ final class Checks {
 
     func equal<T: Equatable>(_ actual: T, _ expected: T, _ what: String, line: UInt = #line) {
         expect(actual == expected, "\(what): got \(actual), expected \(expected)", line: line)
+    }
+}
+
+/// Builds a scan tree in memory: each folder path (relative to the root) gets the given space in
+/// its own files, and every folder on the way is created.
+enum SuggestionTree {
+    static func make(rootPath: String, folders: [(String, Int64)]) -> Node {
+        let root = Node(name: (rootPath as NSString).lastPathComponent, parent: nil)
+        root.rootPath = rootPath
+        for (relative, allocated) in folders {
+            var node = root
+            for name in relative.split(separator: "/").map(String.init) {
+                if let existing = node.children.first(where: { $0.name == name }) {
+                    node = existing
+                } else {
+                    let child = Node(name: name, parent: node)
+                    node.children.append(child)
+                    node = child
+                }
+            }
+            node.ownAllocated += allocated
+            node.ownSize += allocated
+            node.ownFileCount += allocated > 0 ? 1 : 0
+        }
+        finalize(root)
+        return root
+    }
+
+    private static func finalize(_ node: Node) {
+        for child in node.children { finalize(child) }
+        node.finalize()
     }
 }
 

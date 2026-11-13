@@ -8,9 +8,10 @@ enum DetailTab: String, CaseIterable, Identifiable {
     case top = "Top Files"
     case ages = "Ages"
     case history = "History"
+    case suggestions = "Suggestions"
     var id: String { rawValue }
 
-    /// ⌘1 … ⌘7 in the View menu.
+    /// ⌘1 … ⌘8 in the View menu.
     var key: Character {
         switch self {
         case .details: return "1"
@@ -20,6 +21,7 @@ enum DetailTab: String, CaseIterable, Identifiable {
         case .top: return "5"
         case .ages: return "6"
         case .history: return "7"
+        case .suggestions: return "8"
         }
     }
 
@@ -32,6 +34,7 @@ enum DetailTab: String, CaseIterable, Identifiable {
         case .top: return "list.number"
         case .ages: return "clock"
         case .history: return "chart.line.uptrend.xyaxis"
+        case .suggestions: return "lightbulb"
         }
     }
 }
@@ -138,6 +141,11 @@ struct ContentView: View {
                         AgesView(result: result, version: model.version, settings: settings)
                     case .history:
                         HistoryView(model: model, settings: settings)
+                    case .suggestions:
+                        SuggestionsView(model: model, result: result, settings: settings) { folder in
+                            model.navigate(to: folder)
+                            tab = .details
+                        }
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
