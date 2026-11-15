@@ -255,6 +255,12 @@ struct ScanAccumulator {
         pendingBytes += facts.allocated
     }
 
+    /// Records the space a folder itself takes (see `Node.folderAllocated`).
+    mutating func addFolderSpace(_ allocated: Int64, to folder: Node) {
+        folder.folderAllocated = allocated
+        pendingBytes += allocated
+    }
+
     mutating func noteUnreadable(_ path: String) {
         unreadable += 1
         if unreadableSamples.count < ScanAccumulator.sampleLimit { unreadableSamples.append(path) }

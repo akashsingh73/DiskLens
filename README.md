@@ -128,6 +128,9 @@ ad-hoc signature, so use `build.sh` for the copy you keep in Applications.
   Docker's disk image) and compressed files count honestly. It matches `du`.
 - Hard-linked files are counted once. In Details, the other links show 0 on disk and the kind
   "Hard link (counted elsewhere)", so a folder's rows always add up to its total.
+- On exFAT and FAT drives (the formats often used to share a drive with Windows), every folder also takes space of
+  its own, up to 128 KB each on a big drive. That space is part of the folder's total, so totals still match `du`,
+  but it isn't a row in Details.
 - A scan never leaves the disk it started on and never follows symbolic links.
 - Scanning the startup disk scans its data volume (`/System/Volumes/Data`), which holds everything you can change.
   The read-only macOS system volume is not included.

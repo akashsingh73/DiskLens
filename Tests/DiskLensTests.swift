@@ -139,6 +139,34 @@ struct DiskLensTests {
             c.equal(NameTools.fileExtension(of: name), expected, "extension of \(name)")
         }
 
+        c.section("Space folders themselves take (exFAT and FAT drives)")
+        let top = Node(name: "Drive", parent: nil)
+        top.rootPath = "/Volumes/Drive"
+        top.folderAllocated = 128
+        let photos = Node(name: "Photos", parent: top)
+        photos.folderAllocated = 128
+        photos.ownAllocated = 1_000
+        photos.ownSize = 900
+        photos.ownFileCount = 2
+        let waiting = Node(name: "Backups", parent: top)
+        waiting.folderAllocated = 128
+        waiting.pending = true
+        top.children = [photos, waiting]
+        photos.finalize()
+        top.finalize()
+        c.equal(photos.allocated, 1_128, "a folder's total includes the space it takes itself")
+        c.equal(photos.size, 900, "but not its size (what its files contain)")
+        c.equal(photos.filesNode?.allocated, 1_000, "[Files] stays the files alone")
+        c.equal(top.allocated, 1_256, "folders still being read count once they arrive")
+        let contents = Node(name: "Backups", parent: nil)
+        contents.ownAllocated = 500
+        contents.ownFileCount = 1
+        waiting.adopt(contentsOf: contents)
+        c.equal(waiting.allocated, 628, "a folder read later keeps the space it takes itself")
+        c.equal(top.allocated, 1_884, "and its total reaches the folders above")
+        top.removeChild(photos)
+        c.equal(top.allocated, 756, "moving a folder to the Trash takes away its own space too")
+
         c.section("Counts with nouns")
         c.equal(SizeFormat.count(1, "extra hard link"), "1 extra hard link", "one")
         c.equal(SizeFormat.count(2, "extra hard link"), "2 extra hard links", "two")

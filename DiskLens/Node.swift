@@ -31,6 +31,12 @@ final class Node: Identifiable, @unchecked Sendable {
     var ownFileCount: Int = 0
     var ownNewest: Int64 = 0
 
+    /// Space the folder itself takes on disk (where its list of contents is kept), apart from what it
+    /// holds. Nothing on APFS and Mac OS Extended; a whole cluster or more on exFAT and FAT drives
+    /// (128 KB per folder on a big exFAT drive). Part of `allocated`, but not of `ownAllocated`,
+    /// which stays the folder's files alone (so "[Files]" and the files in Details add up to it).
+    var folderAllocated: Int64 = 0
+
     var unreadable = false       // could not be opened (permissions)
     var otherVolume = false      // a mount point for another disk; not scanned
     var cloudOnly = false        // only in the cloud (iCloud Drive, Google Drive…); not read (yet)
@@ -125,7 +131,7 @@ final class Node: Identifiable, @unchecked Sendable {
     /// Recomputes branch totals from the folder's own files and its (already final) children.
     func finalize() {
         var size = ownSize
-        var allocated = ownAllocated
+        var allocated = ownAllocated + folderAllocated
         var files = ownFileCount
         var folders = 0
         var newest = ownNewest
@@ -181,6 +187,7 @@ final class Node: Identifiable, @unchecked Sendable {
     /// Takes over the contents of `scanned` (this same folder, read on another thread into a
     /// tree of its own) and updates the totals of every folder above. This is how folders read
     /// during a scan, and cloud folders read after it, appear in a tree that is already on screen.
+    /// The folder keeps its own `folderAllocated`, measured when it was found.
     /// Main thread once the tree is shown.
     func adopt(contentsOf scanned: Node) {
         let before = (size: size, allocated: allocated, files: fileCount, folders: folderCount,

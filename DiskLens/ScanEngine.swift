@@ -9,6 +9,8 @@ import Glibc
 ///
 /// Accuracy rules:
 /// - Space on disk is `st_blocks × 512` (sparse, compressed and cloud-evicted files report honestly).
+///   That includes what folders themselves take (`Node.folderAllocated`: only on exFAT and FAT drives),
+///   so totals match `du`.
 /// - Hard-linked files are counted once.
 /// - The scan never leaves the starting volume; other disks mounted inside are marked, not entered.
 /// - Symbolic links are not followed.
@@ -126,6 +128,7 @@ enum ScanEngine {
         let root = Node(name: displayName, parent: nil)
         root.rootPath = path
         var main = ScanAccumulator(topCount: topCount)
+        main.addFolderSpace(rootFacts.allocated, to: root)
 
         // Read the first two levels directly, then scan each deeper branch on its own core.
         let firstLevel = listFolder(path: path, folder: root, rootDevice: rootDevice,
@@ -208,6 +211,7 @@ enum ScanEngine {
                 let child = Node(name: name, parent: folder)
                 folder.children.append(child)
                 acc.pendingFolders += 1
+                if facts.device == rootDevice { acc.addFolderSpace(facts.allocated, to: child) }
                 if facts.isDataless {
                     child.cloudOnly = true
                     acc.cloudOnly += 1
@@ -287,20 +291,23 @@ enum ScanEngine {
                 let parentNode = stack[level - 1]
                 let child = Node(name: entryName(entry), parent: parentNode)
                 parentNode.children.append(child)
+                let sameDisk = FileFacts.normalize(entry.pointee.fts_dev) == rootDevice
+                if sameDisk, let st = entry.pointee.fts_statp {
+                    acc.addFolderSpace(FileFacts(st.pointee).allocated, to: child)
+                }
                 if dataless {
                     child.cloudOnly = true
                     acc.cloudOnly += 1
                     acc.cloudFolders.append(CloudFolder(path: String(cString: entry.pointee.fts_path),
                                                         name: child.name, node: child))
-                } else if FileFacts.normalize(entry.pointee.fts_dev) != rootDevice {
+                } else if !sameDisk {
                     child.otherVolume = true          // fts will not descend into it (FTS_XDEV)
                     acc.otherVolumes += 1
-                } else if handOff, level <= 3, let split, (entry.pointee.fts_statp?.pointee.st_nlink ?? 0) > 4 {
+                } else if handOff, level <= 3, let split, worthHandingOff(entry) {
                     // Another worker is idle: hand it this subfolder instead of reading it here.
-                    // Only folders near the top of this branch with at least three subfolders
-                    // (a folder's link count is 2 plus its subfolders) are worth the hand-off;
-                    // tiny ones would cost more than they save. It arrives later as a piece of
-                    // its own and fills this placeholder in.
+                    // Only folders near the top of this branch that hold a few things are worth
+                    // the hand-off; tiny ones would cost more than they save. It arrives later as
+                    // a piece of its own and fills this placeholder in.
                     handOff = false
                     fts_set(stream, entry, FTS_SKIP)
                     child.pending = true
@@ -342,6 +349,9 @@ enum ScanEngine {
                 } else if stack.count >= level {
                     let parentNode = stack[level - 1]
                     let child = Node(name: entryName(entry), parent: parentNode)
+                    if FileFacts.normalize(entry.pointee.fts_dev) == rootDevice, let st = entry.pointee.fts_statp {
+                        acc.addFolderSpace(FileFacts(st.pointee).allocated, to: child)
+                    }
                     mark(child)
                     child.finalize()
                     parentNode.children.append(child)
@@ -365,6 +375,17 @@ enum ScanEngine {
 
         // Only reached with folders still open after an unexpected error: close them out.
         while let node = stack.popLast() { node.finalize() }
+    }
+
+    /// Whether a folder met while reading a branch is worth handing to an idle worker. APFS and Mac OS
+    /// Extended give a folder a link count of 2 plus what it holds, so more than 4 means a few items.
+    /// exFAT and FAT drives (and some network drives) always say 1: there any folder near the top
+    /// is handed off, since how much it holds can't be told without reading it. Measured on an
+    /// exFAT drive with nearly everything in one folder: 0.17 s without that, 0.06 s with it.
+    @inline(__always)
+    private static func worthHandingOff(_ entry: UnsafeMutablePointer<FTSENT>) -> Bool {
+        let links = entry.pointee.fts_statp?.pointee.st_nlink ?? 0
+        return links > 4 || links < 2
     }
 
     @inline(__always)

@@ -652,9 +652,14 @@ final class AppModel: ObservableObject {
 
     /// Size and free space of the disk that holds `path`. Takes several milliseconds.
     nonisolated static func volumeInfo(at path: String) -> VolumeInfo? {
-        let keys: Set<URLResourceKey> = [.volumeTotalCapacityKey, .volumeAvailableCapacityForImportantUsageKey]
+        let keys: Set<URLResourceKey> = [.volumeTotalCapacityKey, .volumeAvailableCapacityForImportantUsageKey,
+                                         .volumeAvailableCapacityKey]
         guard let values = try? URL(fileURLWithPath: path).resourceValues(forKeys: keys),
               let total = values.volumeTotalCapacity else { return nil }
-        return VolumeInfo(total: Int64(total), available: values.volumeAvailableCapacityForImportantUsage ?? 0)
+        // "For important usage" also counts space macOS can free up on its own (purgeable files), as
+        // Finder does, but external drives report it as 0: there the plain free space is the right one.
+        let important = values.volumeAvailableCapacityForImportantUsage ?? 0
+        let available = important > 0 ? important : Int64(values.volumeAvailableCapacity ?? 0)
+        return VolumeInfo(total: Int64(total), available: available)
     }
 }
