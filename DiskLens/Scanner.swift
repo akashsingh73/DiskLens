@@ -159,6 +159,20 @@ struct FileFacts {
         #endif
     }
 
+    /// Facts read with `getattrlistbulk` rather than `stat` (see `FolderReader`): the same values.
+    init(size: Int64, allocated: Int64, modified: Int64, device: UInt64, inode: UInt64, links: UInt64,
+         mode: UInt32, flags: UInt32) {
+        self.size = size
+        self.allocated = allocated
+        self.modified = modified
+        self.device = device
+        self.inode = inode
+        self.links = links
+        self.mode = mode
+        self.flags = flags
+        isDirectory = (mode & UInt32(S_IFMT)) == UInt32(S_IFDIR)
+    }
+
     var key: FileKey { FileKey(device: device, inode: inode) }
     /// Only in the cloud (iCloud Drive, Google Drive, Dropbox, OneDrive…): nothing of it is on this
     /// Mac, and for a folder even the list of what's inside has to be fetched from the internet.
@@ -441,14 +455,142 @@ enum FolderReader {
     /// `uncounted` is the folder's `Node.uncountedLinks`, so hard links come out exactly as the
     /// scan counted them: the folder's counted files add up to its `own` totals.
     static func files(in path: String, uncounted: [FileKey: Int]?) -> [FolderFile]? {
-        CloudFiles.withoutFetching { readFiles(in: path, uncounted: uncounted) }
+        var all: [FolderFile] = []
+        let readable = files(in: path, uncounted: uncounted) { batch in
+            all += batch
+            return true
+        }
+        return readable ? all : nil
     }
 
-    private static func readFiles(in path: String, uncounted: [FileKey: Int]?) -> [FolderFile]? {
-        guard let dir = opendir(path) else { return nil }
+    /// Reads the files directly in `path` a batch at a time, in the order the folder lists them, and
+    /// hands each batch to `batch` (on this thread), which returns false to stop. Returns false if the
+    /// folder can't be read. Folders whose own drive can't read in one pass are read file by file.
+    @discardableResult
+    static func files(in path: String, uncounted: [FileKey: Int]?, batch: ([FolderFile]) -> Bool) -> Bool {
+        CloudFiles.withoutFetching {
+            var remaining = uncounted ?? [:]
+            // The scan's hard-link rule, applied in reading order (see `files(in:uncounted:)`).
+            func counted(_ facts: FileFacts) -> Bool {
+                guard facts.links > 1, let left = remaining[facts.key], left > 0 else { return true }
+                remaining[facts.key] = left - 1
+                return false
+            }
+            switch readInOnePass(path, counted: counted, batch: batch) {
+            case .read: return true
+            case .unreadable: return false
+            case .unsupported: return readFileByFile(path, counted: counted, batch: batch)
+            }
+        }
+    }
+
+    private enum OnePass { case read, unreadable, unsupported }
+
+    /// Reads the folder's entries together with their details, a few thousand per call
+    /// (`getattrlistbulk`, as Finder does). Asking for each file's details by name instead (`stat`)
+    /// means a separate lookup per file, which on exFAT and FAT drives searches the whole folder each
+    /// time: a 26,800-file folder on a USB drive took 3.3 s that way and 0.02 s this way.
+    private static func readInOnePass(_ path: String, counted: (FileFacts) -> Bool,
+                                      batch: ([FolderFile]) -> Bool) -> OnePass {
+        let fd = open(path, O_RDONLY | O_DIRECTORY)
+        guard fd >= 0 else { return .unreadable }
+        defer { close(fd) }
+
+        var request = attrlist()
+        request.bitmapcount = u_short(ATTR_BIT_MAP_COUNT)
+        // The values come back in this order: common attributes by bit (except the error, see
+        // below), then file attributes by bit.
+        request.commonattr = attrgroup_t(ATTR_CMN_RETURNED_ATTRS) | attrgroup_t(ATTR_CMN_NAME)
+            | attrgroup_t(ATTR_CMN_DEVID) | attrgroup_t(ATTR_CMN_OBJTYPE) | attrgroup_t(ATTR_CMN_MODTIME)
+            | attrgroup_t(ATTR_CMN_ACCESSMASK) | attrgroup_t(ATTR_CMN_FLAGS) | attrgroup_t(ATTR_CMN_FILEID)
+            | attrgroup_t(ATTR_CMN_ERROR)
+        request.fileattr = attrgroup_t(ATTR_FILE_LINKCOUNT) | attrgroup_t(ATTR_FILE_ALLOCSIZE)
+            | attrgroup_t(ATTR_FILE_DATALENGTH)
+        let neededCommon = request.commonattr & ~attrgroup_t(ATTR_CMN_RETURNED_ATTRS) & ~attrgroup_t(ATTR_CMN_ERROR)
+        let neededFile = request.fileattr
+
+        let capacity = 256 * 1024
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: capacity, alignment: 16)
+        defer { buffer.deallocate() }
+        var first = true
+        while true {
+            // Unsupported attributes are packed too (with zeros), so every entry has the same layout;
+            // the returned set says which values are real.
+            let count = getattrlistbulk(fd, &request, buffer, capacity, UInt64(FSOPT_PACK_INVAL_ATTRS))
+            if count < 0 {
+                // A drive that can't do this at all says so on the first call: read it file by file.
+                return first && (errno == ENOTSUP || errno == EINVAL || errno == ENOSYS) ? .unsupported : .read
+            }
+            first = false
+            if count == 0 { return .read }
+            var files: [FolderFile] = []
+            files.reserveCapacity(Int(count))
+            var entry = UnsafeRawPointer(buffer)
+            for _ in 0..<count {
+                var offset = 0
+                func next<T>(_: T.Type) -> T {
+                    let value = entry.loadUnaligned(fromByteOffset: offset, as: T.self)
+                    offset += MemoryLayout<T>.size
+                    return value
+                }
+                let length = Int(next(UInt32.self))
+                let returned = next(attribute_set_t.self)
+                // The entry's error, if any, comes right after the returned set (not in bit order).
+                let error = returned.commonattr & attrgroup_t(ATTR_CMN_ERROR) != 0 ? next(UInt32.self) : 0
+                let nameStart = offset
+                let nameOffset = Int(next(Int32.self))
+                _ = next(UInt32.self)
+                let name = String(cString: (entry + nameStart + nameOffset).assumingMemoryBound(to: CChar.self))
+                let device = next(dev_t.self)
+                let type = next(fsobj_type_t.self)
+                let modified = next(timespec.self)
+                let access = next(UInt32.self)
+                let flags = next(UInt32.self)
+                let inode = next(UInt64.self)
+                let links = next(UInt32.self)
+                let allocated = next(off_t.self)
+                let size = next(off_t.self)
+                defer { entry += length }
+
+                if type == VDIR.rawValue { continue }
+                let facts: FileFacts
+                if error == 0, returned.commonattr & neededCommon == neededCommon,
+                   returned.fileattr & neededFile == neededFile {
+                    facts = FileFacts(size: Int64(size), allocated: Int64(allocated), modified: Int64(modified.tv_sec),
+                                      device: FileFacts.normalize(device), inode: inode, links: UInt64(links),
+                                      mode: typeBits(type) | (access & 0o7777), flags: flags)
+                } else {
+                    // This drive left something out for this file: ask for it the usual way.
+                    var st = stat()
+                    guard fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { continue }
+                    facts = FileFacts(st)
+                    if facts.isDirectory { continue }
+                }
+                files.append(FolderFile(name: name, facts: facts, counted: counted(facts)))
+            }
+            if !files.isEmpty, !batch(files) { return .read }
+        }
+    }
+
+    /// The `stat` file type for a `getattrlistbulk` object type.
+    private static func typeBits(_ type: fsobj_type_t) -> UInt32 {
+        switch type {
+        case VREG.rawValue: return UInt32(S_IFREG)
+        case VDIR.rawValue: return UInt32(S_IFDIR)
+        case VLNK.rawValue: return UInt32(S_IFLNK)
+        case VBLK.rawValue: return UInt32(S_IFBLK)
+        case VCHR.rawValue: return UInt32(S_IFCHR)
+        case VSOCK.rawValue: return UInt32(S_IFSOCK)
+        case VFIFO.rawValue: return UInt32(S_IFIFO)
+        default: return UInt32(S_IFREG)
+        }
+    }
+
+    /// Lists the folder and asks for each file's details by name: for drives that can't do `readInOnePass`.
+    static func readFileByFile(_ path: String, counted: (FileFacts) -> Bool, batch: ([FolderFile]) -> Bool) -> Bool {
+        guard let dir = opendir(path) else { return false }
         defer { closedir(dir) }
         let fd = dirfd(dir)
-        var remaining = uncounted ?? [:]
         var files: [FolderFile] = []
         while let entry = readdir(dir) {
             let name = NameTools.name(of: entry)
@@ -457,14 +599,14 @@ enum FolderReader {
             guard fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { continue }
             let facts = FileFacts(st)
             if facts.isDirectory { continue }
-            var counted = true
-            if facts.links > 1, let left = remaining[facts.key], left > 0 {
-                remaining[facts.key] = left - 1
-                counted = false
+            files.append(FolderFile(name: name, facts: facts, counted: counted(facts)))
+            if files.count == 1_000 {
+                guard batch(files) else { return true }
+                files.removeAll(keepingCapacity: true)
             }
-            files.append(FolderFile(name: name, facts: facts, counted: counted))
         }
-        return files
+        if !files.isEmpty { _ = batch(files) }
+        return true
     }
 }
 

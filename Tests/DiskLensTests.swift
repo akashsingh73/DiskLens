@@ -820,6 +820,57 @@ struct DiskLensTests {
             }
         }
 
+        c.section("Reading a folder in one pass")
+        // Every folder of the test tree (hard links, a sparse file, symbolic links, an executable):
+        // the one-pass reader gives exactly what asking for each file by name gives.
+        var compared = 0
+        var folders = [root]
+        while let folder = folders.popLast() {
+            folders.append(contentsOf: folder.children)
+            guard !folder.unreadable, !folder.otherVolume,
+                  let fast = FolderReader.files(in: folder.path, uncounted: folder.uncountedLinks) else { continue }
+            var remaining = folder.uncountedLinks ?? [:]
+            var slow: [FolderFile] = []
+            FolderReader.readFileByFile(folder.path, counted: { facts in
+                guard facts.links > 1, let left = remaining[facts.key], left > 0 else { return true }
+                remaining[facts.key] = left - 1
+                return false
+            }, batch: { slow += $0; return true })
+            func describe(_ files: [FolderFile]) -> [String] {
+                files.map { f in
+                    let x = f.facts
+                    return "\(f.name) \(x.size) \(x.allocated) \(x.modified) \(x.device) \(x.inode) \(x.links) \(String(x.mode, radix: 8)) \(x.flags)"
+                }.sorted()
+            }
+            c.equal(describe(fast), describe(slow), "every file's details in \(folder.name)")
+            c.equal(fast.filter(\.counted).count, slow.filter(\.counted).count, "counted files in \(folder.name)")
+            compared += 1
+        }
+        c.expect(compared > 5, "compared \(compared) folders")
+
+        // A big folder arrives in batches while it is read, and reading stops when asked to.
+        let many = (f.root as NSString).appendingPathComponent("many")
+        try? FileManager.default.createDirectory(atPath: many, withIntermediateDirectories: true)
+        for i in 0..<6_000 {
+            FileManager.default.createFile(atPath: (many as NSString).appendingPathComponent("file \(i).dat"), contents: Data([1]))
+        }
+        var batches = 0
+        var rows = 0
+        DetailLoader.streamFiles(in: many, folderTotal: 1, uncounted: nil, every: 0) { delivered in
+            batches += 1
+            rows += delivered.count
+            return true
+        }
+        c.equal(rows, 6_000, "all 6,000 files of a big folder are listed")
+        c.expect(batches > 1, "they arrive in \(batches) batches, not all at the end")
+        var firstOnly = 0
+        DetailLoader.streamFiles(in: many, folderTotal: 1, uncounted: nil, every: 0) { delivered in
+            firstOnly += delivered.count
+            return false
+        }
+        c.expect(firstOnly > 0 && firstOnly < 6_000, "reading stops when asked (\(firstOnly) files read)")
+        try? FileManager.default.removeItem(atPath: many)
+
         searchFixtureTests(f, result, c)
 
         c.section("Moving to the Trash (File Types and Ages)")

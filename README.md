@@ -201,7 +201,10 @@ A few rules keep DiskLens stable; please keep to them:
 - **Never wait on the cloud during a scan**: scan threads run with cloud fetching turned off (`CloudFiles`).
 - **Big folders stay responsive**: Details and the folder tree are AppKit tables, which only make the rows on
   screen, so a folder of 63,000 files lists in about a third of a second (SwiftUI's `Table` froze the window for
-  over two seconds at 50,000 rows); keep them that way. "Expand All
+  over two seconds at 50,000 rows); keep them that way. Details reads a folder's files in one pass
+  (`getattrlistbulk`, like Finder) rather than looking each file up by name, which on exFAT drives searched the
+  whole folder for every file (3.3 s against 0.02 s for 26,800 files); the rows appear as they are read, with
+  "Reading 12,000 of 63,855 files" whenever it takes more than a moment. "Expand All
   Below" stops after a few thousand folders, and search keeps only the 500 largest matches and reads folders on
   background threads, stopping as soon as the text changes.
 
