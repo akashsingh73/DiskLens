@@ -310,7 +310,6 @@ struct SearchPanel: View {
     @ObservedObject var model: AppModel
     @ObservedObject var search: SearchModel
     @FocusState private var fieldFocused: Bool
-    @AppStorage("detailTab") private var tab: DetailTab = .details
     private var prefs = DisplayPrefs()
 
     init(model: AppModel, search: SearchModel) {
@@ -469,8 +468,8 @@ struct SearchPanel: View {
             NSSound.beep()
             return
         }
-        if target.kind == .file || ![.details, .treemap, .chart].contains(tab) {
-            tab = .details
+        if target.kind == .file || ![.details, .treemap, .chart].contains(model.tab) {
+            model.tab = .details
         }
         search.choose(target)
     }

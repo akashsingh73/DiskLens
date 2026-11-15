@@ -48,7 +48,6 @@ enum DetailTab: String, CaseIterable, Identifiable {
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
     private var prefs = DisplayPrefs()
-    @AppStorage("detailTab") private var tab: DetailTab = .details
 
     var body: some View {
         let settings = prefs.settings
@@ -79,7 +78,7 @@ struct ContentView: View {
                 UnreadableFoldersSheet(result: result) { model.showingUnreadable = false }
             }
         }
-        .onAppear { model.installMouseNavigation() }
+        .background(WindowReader { model.attach(to: $0) })
     }
 
     // MARK: Sidebar
@@ -106,7 +105,7 @@ struct ContentView: View {
                                     stopCloud: { model.stopReadingCloud() }) {
                             model.showingUnreadable = true
                         } showChanges: {
-                            tab = .history
+                            model.tab = .history
                         }
                     }
                 }
@@ -131,14 +130,14 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 PathBar(node: node, settings: settings) { model.navigate(to: $0) }
                 HStack {
-                    TabBar(tab: $tab)
+                    TabBar(tab: $model.tab)
                     Spacer(minLength: 0)
                 }
                 .padding(.horizontal, 8)
                 .padding(.bottom, 6)
                 Divider()
                 Group {
-                    switch tab {
+                    switch model.tab {
                     case .details:
                         DetailsView(model: model, node: node, settings: settings)
                     case .treemap:
@@ -156,7 +155,7 @@ struct ContentView: View {
                     case .suggestions:
                         SuggestionsView(model: model, result: result, settings: settings) { folder in
                             model.navigate(to: folder)
-                            tab = .details
+                            model.tab = .details
                         }
                     }
                 }
@@ -171,6 +170,34 @@ struct ContentView: View {
 }
 
 // MARK: - Split view
+
+/// Tells its owner which window it is in, once it is in one (the model of each window needs to know).
+struct WindowReader: NSViewRepresentable {
+    let found: @MainActor (NSWindow) -> Void
+
+    func makeNSView(context: Context) -> NSView { WindowReaderView(found: found) }
+    func updateNSView(_ view: NSView, context: Context) {}
+
+    private final class WindowReaderView: NSView {
+        let found: @MainActor (NSWindow) -> Void
+
+        init(found: @escaping @MainActor (NSWindow) -> Void) {
+            self.found = found
+            super.init(frame: .zero)
+        }
+
+        required init?(coder: NSCoder) {
+            fatalError("WindowReaderView is created in code")
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let window { found(window) }
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+}
 
 /// Dropping a folder anywhere on the window scans it.
 struct ScanDropTarget: ViewModifier {

@@ -32,7 +32,8 @@ final class CloudReadStatus: ObservableObject {
     @Published fileprivate(set) var progress = Progress()
 }
 
-/// App state: the current scan, where the user is, navigation history, and scan control.
+/// The state of one window: its scan, where the user is, navigation history, and scan control.
+/// Each window has a model of its own (see `ScanWindow`), so windows scan independently.
 /// Everything here runs on the main thread; the scan itself runs on background threads.
 @MainActor
 final class AppModel: ObservableObject {
@@ -41,6 +42,11 @@ final class AppModel: ObservableObject {
     @Published private(set) var scanningName = ""
     /// The folder (or "[Files]" entry) shown in the right-hand views.
     @Published private(set) var selection: Node?
+    /// The view shown on the right. A new window starts with the one used last.
+    @Published var tab = DetailTab(rawValue: UserDefaults.standard.string(forKey: AppModel.tabKey) ?? "") ?? .details {
+        didSet { UserDefaults.standard.set(tab.rawValue, forKey: Self.tabKey) }
+    }
+    private static let tabKey = "detailTab"
     /// Changes whenever the folder tree should expand down to `selection` and scroll to it.
     @Published private(set) var revealToken = 0
     /// Bumped whenever the tree changes after a scan (for example after moving something to the Trash).
@@ -95,6 +101,51 @@ final class AppModel: ObservableObject {
     init() {
         search.app = self
         refreshVolumes()
+        // Another window finished a scan: keep the recent scans and History up to date here too.
+        historyObserver = NotificationCenter.default.addObserver(forName: HistoryStore.didChange, object: nil,
+                                                                 queue: .main) { [weak self] note in
+            let changedHere = note.object as AnyObject? === self
+            MainActor.assumeIsolated {
+                guard let self, !changedHere else { return }
+                self.recentScans = HistoryStore.recent()
+                if let path = self.result?.rootPath { self.history = HistoryStore.entries(for: path) }
+            }
+        }
+    }
+
+    /// The window this model belongs to, and what it watches there.
+    private(set) weak var window: NSWindow?
+    private var windowObserver: NSObjectProtocol?
+    private var historyObserver: NSObjectProtocol?
+
+    /// Called once the window's views are in place (see `WindowReader`): the mouse's back and
+    /// forward buttons work in this window, and closing it stops whatever it is still reading.
+    func attach(to window: NSWindow) {
+        guard self.window !== window else { return }
+        self.window = window
+        if let observer = windowObserver { NotificationCenter.default.removeObserver(observer) }
+        windowObserver = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window,
+                                                                queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.windowWillClose() }
+        }
+        installMouseNavigation()
+    }
+
+    /// The window is closing: stop the scan, the cloud folders and search, and stop listening.
+    private func windowWillClose() {
+        cancel()
+        stopReadingCloud()
+        search.isPresented = false
+        search.scanStarted()
+        if let monitor = mouseMonitor {
+            NSEvent.removeMonitor(monitor)
+            mouseMonitor = nil
+        }
+        for observer in [windowObserver, historyObserver].compactMap({ $0 }) {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        windowObserver = nil
+        historyObserver = nil
     }
 
     private var activeProgress: ScanProgress?
@@ -298,6 +349,7 @@ final class AppModel: ObservableObject {
         HistoryStore.append(historyEntry(for: scan))
         history = HistoryStore.entries(for: scan.rootPath)
         recentScans = HistoryStore.recent()
+        NotificationCenter.default.post(name: HistoryStore.didChange, object: self)
         refreshVolumes()
 
         if Prefs.cloudFolderMode == .read && !scan.cloudFolders.isEmpty {
@@ -378,6 +430,7 @@ final class AppModel: ObservableObject {
         HistoryStore.update(historyEntry(for: scan))
         history = HistoryStore.entries(for: scan.rootPath)
         recentScans = HistoryStore.recent()
+        NotificationCenter.default.post(name: HistoryStore.didChange, object: self)
         refreshVolumes()
         recordSnapshot(of: scan)
     }
@@ -513,13 +566,15 @@ final class AppModel: ObservableObject {
         navigate(to: root)
     }
 
-    /// Lets the back and forward buttons on a mouse move through the folder history.
-    func installMouseNavigation() {
+    /// Lets the back and forward buttons on a mouse move through the folder history, in this
+    /// model's window only.
+    private func installMouseNavigation() {
         guard mouseMonitor == nil else { return }
         mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: .otherMouseUp) { [weak self] event in
             let handled: Bool = MainActor.assumeIsolated {
                 let button = event.buttonNumber
-                guard button == 3 || button == 4, let self, self.result != nil, !self.isScanning else { return false }
+                guard button == 3 || button == 4, let self, event.window === self.window,
+                      self.result != nil, !self.isScanning else { return false }
                 if button == 3 { self.goBack() } else { self.goForward() }
                 return true
             }

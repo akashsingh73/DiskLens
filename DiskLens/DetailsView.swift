@@ -56,8 +56,6 @@ extension DetailItem: FastSortable {
 
 /// Reads the files of one folder off the main thread.
 enum DetailLoader {
-    /// Folders with more files than this list only the largest ones, so the list stays fast.
-    static let fileLimit = 50_000
     static let uncountedLinkKind = "Hard link (counted elsewhere)"
 
     struct Listing: Sendable {
@@ -75,9 +73,10 @@ enum DetailLoader {
             return Listing()
         }
         var items: [DetailItem] = []
-        items.reserveCapacity(min(files.count, fileLimit))
+        items.reserveCapacity(files.count)
+        let folderPrefix = path.hasSuffix("/") ? path : path + "/"
         for file in files {
-            let filePath = (path as NSString).appendingPathComponent(file.name)
+            let filePath = folderPrefix + file.name
             let allocated = file.counted ? file.facts.allocated : 0
             items.append(DetailItem(
                 id: filePath, name: file.name, isFolder: false,
@@ -88,12 +87,8 @@ enum DetailLoader {
                 unreadable: false,
                 uncountedLink: file.counted ? nil : file.facts.key))
         }
-        let total = items.count
-        if items.count > fileLimit {
-            items.sort { $0.allocated > $1.allocated }
-            items.removeSubrange(fileLimit...)
-        }
-        return Listing(items: items, total: total)
+        // Every file is listed: the table only makes the rows on screen, however many there are.
+        return Listing(items: items, total: items.count)
     }
 }
 
@@ -113,10 +108,23 @@ enum KindNames {
             key = file.facts.isExecutable ? "executable" : "plain"
         }
         if let cached = cache.withLock({ $0[key] }) { return cached }
+        // Asking macOS takes about 0.1 ms, once per extension. Some apps give their cache files
+        // random extensions ("a8f3b2c1"), one per file, which made a folder of them take seconds.
+        // An extension that isn't a short word and that macOS doesn't know is "Document" in Finder
+        // anyway, so that is what it gets, without asking (and without filling the cache).
+        if !file.facts.isSymbolicLink, !ext.isEmpty, !looksLikeWord(ext),
+           UTType(filenameExtension: ext)?.isDynamic ?? true {
+            return "Document"
+        }
         let url = URL(fileURLWithPath: path)
         let kind = (try? url.resourceValues(forKeys: [.localizedTypeDescriptionKey]))?.localizedTypeDescription ?? "Document"
         cache.withLock { $0[key] = kind }
         return kind
+    }
+
+    /// Up to five letters ("dat"): an extension an app may give a name to without macOS knowing it.
+    private static func looksLikeWord(_ ext: String) -> Bool {
+        ext.utf8.count <= 5 && ext.utf8.allSatisfy { $0 >= UInt8(ascii: "a") && $0 <= UInt8(ascii: "z") }
     }
 }
 
@@ -168,168 +176,56 @@ struct DetailsView: View {
         let comparedWith: Date?
     }
 
+    /// Folders with at least this many files say so while they are read (smaller ones take a moment).
+    private static let manyFiles = 2_000
+
     var body: some View {
-        VStack(spacing: 0) {
-            table
-            if state.hiddenFiles > 0 {
-                Divider()
-                Text("Showing the \(SizeFormat.count(DetailLoader.fileLimit)) largest of \(SizeFormat.count(state.totalFiles)) files in this folder")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 10)
-                    .frame(height: 24)
+        DetailsTable(rows: state.rows, rowsVersion: state.rowsVersion, settings: settings,
+                     since: model.changes.map { Theme.shortDate($0.base.date) } ?? "the last scan",
+                     sortOrder: $state.sortOrder, selection: $state.selection, scrollTarget: $state.scrollTarget,
+                     open: { openItem($0) }, showContents: { showContents($0) },
+                     quickLook: { quickLook($0) }, trash: { trash($0) })
+            .quickLookPreview($state.previewURL)
+            .overlay {
+                if state.loading && state.rows.isEmpty { ProgressView() }
             }
-        }
-        .task(id: LoadKey(node: node.id, version: model.version, comparedWith: model.changes?.base.date)) {
-            await reload()
-        }
-        .onChange(of: model.fileToHighlight) { showPendingFile() }
-    }
-
-    private var table: some View {
-        ScrollViewReader { proxy in
-            rowsTable
-                .onChange(of: state.scrollTarget) {
-                    guard let target = state.scrollTarget else { return }
-                    // Centred vertically, at the leading edge horizontally, so the Name column stays in view.
-                    proxy.scrollTo(target, anchor: UnitPoint(x: 0, y: 0.5))
-                    state.scrollTarget = nil
-                }
-        }
-    }
-
-    private var rowsTable: some View {
-        Table(state.rows, selection: $state.selection, sortOrder: $state.sortOrder,
-              columnCustomization: $state.columns) {
-            TableColumn("Name", value: \.name) { item in
-                HStack(spacing: 6) {
-                    Image(nsImage: IconCache.icon(for: item))
-                        .resizable()
-                        .frame(width: 16, height: 16)
-                    Text(item.name)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .foregroundStyle(item.unreadable ? Color.secondary : Color.primary)
+            .overlay(alignment: .bottom) {
+                let files = node.directory.ownFileCount
+                if state.loading && files >= Self.manyFiles {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Reading \(SizeFormat.count(files, "file"))…")
+                    }
+                    .font(.callout)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(.bottom, 12)
                 }
             }
-            .width(min: 160, ideal: 250)
-            .customizationID("name")
-
-            TableColumn("On Disk", value: \.allocated) { item in
-                Text(settings.bytes(item.allocated)).monospacedDigit()
+            .task(id: LoadKey(node: node.id, version: model.version, comparedWith: model.changes?.base.date)) {
+                await reload()
             }
-            .width(min: 70, ideal: 80)
-            .customizationID("allocated")
-
-            TableColumn("Change", value: \.changeSortKey) { item in
-                if let change = item.change {
-                    changeCell(change)
-                }
-            }
-            .width(min: 80, ideal: 100)
-            .customizationID("change")
-
-            TableColumn("% of Parent", value: \.percent) { item in
-                PercentBar(fraction: item.percent, settings: settings)
-            }
-            .width(min: 100, ideal: 140)
-            .customizationID("percent")
-
-            TableColumn("Size", value: \.size) { item in
-                Text(settings.bytes(item.size)).monospacedDigit()
-            }
-            .width(min: 70, ideal: 80)
-            .customizationID("size")
-
-            TableColumn("Files", value: \.files) { item in
-                Text(item.isFolder ? SizeFormat.count(item.files) : "").monospacedDigit()
-            }
-            .width(min: 50, ideal: 70)
-            .customizationID("files")
-
-            TableColumn("Folders", value: \.folders) { item in
-                Text(item.isFolder ? SizeFormat.count(item.folders) : "").monospacedDigit()
-            }
-            .width(min: 50, ideal: 70)
-            .customizationID("folders")
-
-            TableColumn("Modified", value: \.modified) { item in
-                if item.modified > Date(timeIntervalSince1970: 0) {
-                    Text(item.modified, format: .dateTime.year().month(.abbreviated).day())
-                }
-            }
-            .width(min: 80, ideal: 110)
-            .customizationID("modified")
-
-            TableColumn("Kind", value: \.kind)
-                .width(min: 80, ideal: 140)
-                .customizationID("kind")
-        }
-        .contextMenu(forSelectionType: DetailItem.ID.self) { ids in
-            menu(for: ids)
-        } primaryAction: { ids in
-            openItems(ids)
-        }
-        .quickLookPreview($state.previewURL)
-        .onKeyPress(.space) {
-            guard let id = state.selection.first else { return .ignored }
-            state.previewURL = URL(fileURLWithPath: id)
-            return .handled
-        }
-        .overlay {
-            if state.loading && state.rows.isEmpty { ProgressView() }
-        }
-    }
-
-    /// The Change column: how the folder changed since the earlier scan, like History's Change column.
-    @ViewBuilder
-    private func changeCell(_ change: FolderChange) -> some View {
-        let since = model.changes.map { Theme.shortDate($0.base.date) } ?? "the last scan"
-        switch change.kind {
-        case .added:
-            ChangeLabel(change: change.change, settings: settings)
-                .help("New since \(since)")
-        case .renamed:
-            ChangeLabel(change: change.change, settings: settings)
-                .help("Called “\(change.oldName ?? "")” on \(since), when it took \(settings.bytes(change.before))")
-        default:
-            if change.change == 0 {
-                Text("–")
-                    .foregroundStyle(.tertiary)
-                    .help("No change since \(since)")
-            } else {
-                ChangeLabel(change: change.change, settings: settings)
-                    .help("\(settings.bytes(change.before)) on \(since)")
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func menu(for ids: Set<DetailItem.ID>) -> some View {
-        if let id = ids.first, let item = state.rows.first(where: { $0.id == id }) {
-            if item.isFolder, let folder = state.folderLookup[item.id] {
-                Button("Show Contents") { model.navigate(to: folder) }
-                Divider()
-            }
-            Button("Reveal in Finder") { FileActions.reveal(item.id) }
-            Button("Open") { FileActions.open(item.id) }
-            Button("Quick Look") { state.previewURL = URL(fileURLWithPath: item.id) }
-            Button("Copy Path") { FileActions.copyPath(item.id) }
-            Divider()
-            Button("Move to Trash…", role: .destructive) { trash(item) }
-        }
+            .onChange(of: model.fileToHighlight) { showPendingFile() }
     }
 
     /// Double-click or Return: folders open inside DiskLens, files open in their app.
-    private func openItems(_ ids: Set<DetailItem.ID>) {
-        guard let id = ids.first, let item = state.rows.first(where: { $0.id == id }) else { return }
+    private func openItem(_ item: DetailItem) {
         if item.isFolder {
-            if let folder = state.folderLookup[item.id] { model.navigate(to: folder) }
+            showContents(item)
         } else {
             FileActions.open(item.id)
         }
+    }
+
+    private func showContents(_ item: DetailItem) {
+        if let folder = state.folderLookup[item.id] { model.navigate(to: folder) }
+    }
+
+    /// Space or the menu: shows the item in Quick Look, or closes Quick Look if it already shows it.
+    private func quickLook(_ item: DetailItem) {
+        let url = URL(fileURLWithPath: item.id)
+        state.previewURL = state.previewURL == url ? nil : url
     }
 
     /// The direct child of `folder` that contains `node` (or is `node`), if there is one.
@@ -422,8 +318,6 @@ struct DetailsView: View {
                 return copy
             }
             state.show(folderRows + files)
-            state.totalFiles = cached.listing.total
-            state.hiddenFiles = max(0, cached.listing.total - cached.listing.items.count)
             state.loading = false
             state.listedFolder = path
             state.shownSignature = signature
@@ -431,8 +325,6 @@ struct DetailsView: View {
             return
         }
         state.show(folderRows)
-        state.totalFiles = 0
-        state.hiddenFiles = 0
         guard directory.ownFileCount > 0, !directory.unreadable else {
             state.loading = false
             state.listedFolder = path
@@ -450,8 +342,6 @@ struct DetailsView: View {
         if Task.isCancelled { return }
         state.cachedFiles = (folderID, directory.ownFileCount, directory.ownAllocated, listing)
         state.show(folderRows + listing.items)
-        state.totalFiles = listing.total
-        state.hiddenFiles = max(0, listing.total - listing.items.count)
         state.loading = false
         state.listedFolder = path
         state.shownSignature = signature
@@ -500,13 +390,16 @@ struct FractionBar: Shape {
 /// View state for DetailsView, kept in a class so it builds without SwiftUI's macros.
 final class DetailsState: ObservableObject {
     /// The rows in display order.
-    @Published private(set) var rows: [DetailItem] = []
+    @Published private(set) var rows: [DetailItem] = [] {
+        didSet { rowsVersion += 1 }
+    }
+    /// Changes whenever `rows` does, so the table reloads only then.
+    private(set) var rowsVersion = 0
     @Published var folderLookup: [String: Node] = [:]
     @Published var selection = Set<DetailItem.ID>()
     @Published var sortOrder = [KeyPathComparator(\DetailItem.allocated, order: .reverse)] {
         didSet { rows = FastSort.sorted(items, using: sortOrder) }
     }
-    @Published var columns = TableColumnCustomization<DetailItem>()
     @Published var previewURL: URL?
     /// A row to scroll to (a file chosen in search).
     @Published var scrollTarget: DetailItem.ID?
@@ -519,8 +412,6 @@ final class DetailsState: ObservableObject {
     /// The files of the folder read last, reused while its own files stay the same.
     var cachedFiles: (folder: ObjectIdentifier, ownFiles: Int, ownAllocated: Int64, listing: DetailLoader.Listing)?
     @Published var loading = false
-    @Published var totalFiles = 0
-    @Published var hiddenFiles = 0
     private var items: [DetailItem] = []
 
     /// Everything about a folder its rows show. When this is the same, so are the rows.
@@ -557,5 +448,637 @@ final class DetailsState: ObservableObject {
     func show(_ newItems: [DetailItem]) {
         items = newItems
         rows = FastSort.sorted(newItems, using: sortOrder)
+    }
+}
+
+// MARK: - The table
+
+/// The columns of the Details list.
+enum DetailsColumn: String, CaseIterable {
+    case name, allocated, change, percent, size, files, folders, modified, kind
+
+    var title: String {
+        switch self {
+        case .name: return "Name"
+        case .allocated: return "On Disk"
+        case .change: return "Change"
+        case .percent: return "% of Parent"
+        case .size: return "Size"
+        case .files: return "Files"
+        case .folders: return "Folders"
+        case .modified: return "Modified"
+        case .kind: return "Kind"
+        }
+    }
+
+    var minWidth: CGFloat {
+        switch self {
+        case .name: return 160
+        case .percent: return 100
+        case .change, .modified, .kind: return 80
+        case .allocated, .size: return 70
+        case .files, .folders: return 50
+        }
+    }
+
+    var width: CGFloat {
+        switch self {
+        case .name: return 250
+        case .percent, .kind: return 140
+        case .modified: return 110
+        case .change: return 100
+        case .allocated, .size: return 80
+        case .files, .folders: return 70
+        }
+    }
+
+    /// Numbers are right-aligned, as in Finder.
+    var isNumber: Bool { self == .allocated || self == .size || self == .files || self == .folders }
+
+    /// The first click on a header sorts names and kinds A to Z, everything else biggest (or newest) first.
+    var ascendingFirst: Bool { self == .name || self == .kind }
+
+    func comparator(ascending: Bool) -> KeyPathComparator<DetailItem> {
+        let order: SortOrder = ascending ? .forward : .reverse
+        switch self {
+        case .name: return KeyPathComparator(\DetailItem.name, order: order)
+        case .allocated: return KeyPathComparator(\DetailItem.allocated, order: order)
+        case .change: return KeyPathComparator(\DetailItem.changeSortKey, order: order)
+        case .percent: return KeyPathComparator(\DetailItem.percent, order: order)
+        case .size: return KeyPathComparator(\DetailItem.size, order: order)
+        case .files: return KeyPathComparator(\DetailItem.files, order: order)
+        case .folders: return KeyPathComparator(\DetailItem.folders, order: order)
+        case .modified: return KeyPathComparator(\DetailItem.modified, order: order)
+        case .kind: return KeyPathComparator(\DetailItem.kind, order: order)
+        }
+    }
+
+    /// The column a sort order sorts by.
+    init?(sortingBy comparator: KeyPathComparator<DetailItem>) {
+        guard let column = Self.allCases.first(where: { $0.comparator(ascending: true).keyPath == comparator.keyPath })
+        else { return nil }
+        self = column
+    }
+}
+
+/// The Details list itself: an AppKit table, which only makes the rows on screen, so a folder of tens
+/// of thousands of files shows at once. (SwiftUI's Table took over two seconds to take 50,000 rows,
+/// with the window frozen meanwhile.) Sorting, selection and scrolling go through bindings; the table
+/// is brought in step with them right after SwiftUI's update, never during it (see `scheduleSync`).
+struct DetailsTable: NSViewRepresentable {
+    let rows: [DetailItem]
+    /// Changes whenever `rows` does, so the table reloads only then.
+    let rowsVersion: Int
+    let settings: DisplaySettings
+    /// When the scan the Change column compares with was ("10 Nov"), for its tooltips.
+    let since: String
+    @Binding var sortOrder: [KeyPathComparator<DetailItem>]
+    @Binding var selection: Set<DetailItem.ID>
+    @Binding var scrollTarget: DetailItem.ID?
+    let open: @MainActor (DetailItem) -> Void
+    let showContents: @MainActor (DetailItem) -> Void
+    let quickLook: @MainActor (DetailItem) -> Void
+    let trash: @MainActor (DetailItem) -> Void
+
+    /// The columns hidden with the header's menu.
+    private static let hiddenColumnsKey = "detailsHiddenColumns"
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let table = DetailsTableView()
+        table.style = .fullWidth
+        table.usesAlternatingRowBackgroundColors = true
+        table.rowHeight = 24
+        table.intercellSpacing = NSSize(width: 8, height: 0)
+        table.allowsMultipleSelection = false
+        table.allowsEmptySelection = true
+        table.allowsColumnReordering = true
+        table.allowsColumnResizing = true
+        table.allowsColumnSelection = false
+        table.allowsExpansionToolTips = true
+        table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        for column in DetailsColumn.allCases {
+            let tableColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(column.rawValue))
+            tableColumn.title = column.title
+            tableColumn.minWidth = column.minWidth
+            tableColumn.width = column.width
+            tableColumn.headerCell.alignment = column.isNumber ? .right : .left
+            tableColumn.sortDescriptorPrototype = NSSortDescriptor(key: column.rawValue, ascending: column.ascendingFirst)
+            table.addTableColumn(tableColumn)
+        }
+        // macOS keeps the columns' order and widths between launches.
+        table.autosaveName = "DiskLens.Details"
+        table.autosaveTableColumns = true
+        let hidden = Set(UserDefaults.standard.stringArray(forKey: Self.hiddenColumnsKey) ?? [])
+        for tableColumn in table.tableColumns where tableColumn.identifier.rawValue != DetailsColumn.name.rawValue {
+            tableColumn.isHidden = hidden.contains(tableColumn.identifier.rawValue)
+        }
+
+        let coordinator = context.coordinator
+        table.dataSource = coordinator
+        table.delegate = coordinator
+        table.target = coordinator
+        table.doubleAction = #selector(Coordinator.doubleClicked(_:))
+        table.onKey = { [weak coordinator] key, row in coordinator?.pressed(key, row: row) }
+        table.menu = coordinator.makeMenu()
+        table.headerView?.menu = coordinator.makeHeaderMenu()
+        coordinator.table = table
+
+        let scrollView = NSScrollView()
+        scrollView.documentView = table
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        coordinator.scheduleSync()
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        context.coordinator.parent = self
+        context.coordinator.scheduleSync()
+    }
+
+    static func dismantleNSView(_ scrollView: NSScrollView, coordinator: Coordinator) {
+        coordinator.detach()
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
+        var parent: DetailsTable
+        weak var table: DetailsTableView?
+        /// The rows the table shows (a copy of `parent.rows` from the last sync).
+        private var rows: [DetailItem] = []
+        private var shownVersion = -1
+        private var shownSettings: DisplaySettings?
+        private var shownSince = ""
+        /// Each row's position by path, made when a selection or scroll target has to be found.
+        private var positions: [String: Int]?
+        private var syncScheduled = false
+        /// Set while the table is changed from here, so its notifications don't echo back.
+        private var applying = false
+        private weak var rowMenu: NSMenu?
+        private weak var headerMenu: NSMenu?
+
+        init(parent: DetailsTable) {
+            self.parent = parent
+        }
+
+        func detach() {
+            table?.dataSource = nil
+            table?.delegate = nil
+            table?.onKey = nil
+            table = nil
+            rows = []
+            positions = nil
+        }
+
+        // MARK: Keeping in step with SwiftUI
+
+        /// Called while SwiftUI updates the window. Reloading, selecting or scrolling the table then
+        /// would change AppKit layout in the middle of SwiftUI's own layout pass, so it happens right after.
+        func scheduleSync() {
+            guard !syncScheduled else { return }
+            syncScheduled = true
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.syncScheduled = false
+                self.sync()
+            }
+        }
+
+        private func sync() {
+            guard let table else { return }
+            applying = true
+            defer { applying = false }
+
+            // The sort arrow in the header follows the sort order.
+            if let comparator = parent.sortOrder.first, let column = DetailsColumn(sortingBy: comparator) {
+                let ascending = comparator.order == .forward
+                let current = table.sortDescriptors.first
+                if current?.key != column.rawValue || current?.ascending != ascending {
+                    table.sortDescriptors = [NSSortDescriptor(key: column.rawValue, ascending: ascending)]
+                }
+            }
+
+            if parent.rowsVersion != shownVersion || parent.settings != shownSettings || parent.since != shownSince {
+                let previousRow = table.selectedRow
+                if parent.rowsVersion != shownVersion {
+                    rows = parent.rows
+                    positions = nil
+                    shownVersion = parent.rowsVersion
+                }
+                shownSettings = parent.settings
+                shownSince = parent.since
+                table.reloadData()
+                // The rows may have moved: keep the same item selected, not the same position.
+                select(parent.selection.first, in: table, near: previousRow)
+            } else if let wanted = parent.selection.first, wanted != selectedID(in: table) {
+                select(wanted, in: table, near: table.selectedRow)
+            } else if parent.selection.isEmpty, table.selectedRow >= 0 {
+                table.deselectAll(nil)
+            }
+
+            if let target = parent.scrollTarget {
+                if let row = position(of: target) { scrollToMiddle(row, in: table) }
+                parent.scrollTarget = nil
+            }
+        }
+
+        private func selectedID(in table: NSTableView) -> String? {
+            let row = table.selectedRow
+            return rows.indices.contains(row) ? rows[row].id : nil
+        }
+
+        private func select(_ id: String?, in table: NSTableView, near hint: Int) {
+            guard let id else {
+                if table.selectedRow >= 0 { table.deselectAll(nil) }
+                return
+            }
+            // Usually the item is still where it was; look it up only when it moved.
+            let row = rows.indices.contains(hint) && rows[hint].id == id ? hint : position(of: id)
+            if let row {
+                if table.selectedRow != row { table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false) }
+            } else if table.selectedRow >= 0 {
+                table.deselectAll(nil)
+            }
+        }
+
+        private func position(of id: String) -> Int? {
+            if positions == nil {
+                var map = [String: Int](minimumCapacity: rows.count)
+                for (row, item) in rows.enumerated() { map[item.id] = row }
+                positions = map
+            }
+            return positions?[id]
+        }
+
+        /// Selects a row and scrolls it to the middle, with the Name column in view.
+        private func scrollToMiddle(_ row: Int, in table: NSTableView) {
+            if table.selectedRow != row { table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false) }
+            guard let clip = table.enclosingScrollView?.contentView else {
+                table.scrollRowToVisible(row)
+                return
+            }
+            let rect = table.rect(ofRow: row)
+            let y = max(0, min(rect.midY - clip.bounds.height / 2, table.bounds.height - clip.bounds.height))
+            clip.scroll(to: NSPoint(x: 0, y: y))
+            table.enclosingScrollView?.reflectScrolledClipView(clip)
+        }
+
+        // MARK: Data source and delegate
+
+        func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
+
+        func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+            guard let tableColumn, let column = DetailsColumn(rawValue: tableColumn.identifier.rawValue),
+                  rows.indices.contains(row) else { return nil }
+            let item = rows[row]
+            let settings = parent.settings
+            switch column {
+            case .name:
+                let cell = reuse(tableView, "name") { DetailsNameCell() }
+                cell.show(item)
+                return cell
+            case .percent:
+                let cell = reuse(tableView, "percent") { DetailsPercentCell() }
+                cell.show(fraction: item.percent, settings: settings)
+                return cell
+            case .change:
+                let cell = reuse(tableView, "change") { DetailsChangeCell() }
+                cell.show(item.change, settings: settings, since: parent.since)
+                return cell
+            case .allocated, .size, .files, .folders:
+                let cell = reuse(tableView, "number") { DetailsTextCell(alignment: .right) }
+                switch column {
+                case .allocated: cell.show(settings.bytes(item.allocated))
+                case .size: cell.show(settings.bytes(item.size))
+                case .files: cell.show(item.isFolder ? SizeFormat.count(item.files) : "")
+                default: cell.show(item.isFolder ? SizeFormat.count(item.folders) : "")
+                }
+                return cell
+            case .modified:
+                let cell = reuse(tableView, "text") { DetailsTextCell(alignment: .left) }
+                cell.show(item.modified > Date(timeIntervalSince1970: 0)
+                          ? item.modified.formatted(.dateTime.year().month(.abbreviated).day()) : "")
+                return cell
+            case .kind:
+                let cell = reuse(tableView, "text") { DetailsTextCell(alignment: .left) }
+                cell.show(item.kind)
+                return cell
+            }
+        }
+
+        private func reuse<Cell: NSView>(_ tableView: NSTableView, _ kind: String, make: () -> Cell) -> Cell {
+            let identifier = NSUserInterfaceItemIdentifier("DetailsCell." + kind)
+            if let cell = tableView.makeView(withIdentifier: identifier, owner: nil) as? Cell { return cell }
+            let cell = make()
+            cell.identifier = identifier
+            return cell
+        }
+
+        func tableViewSelectionDidChange(_ notification: Notification) {
+            guard !applying, let table else { return }
+            let id = selectedID(in: table)
+            parent.selection = id.map { [$0] } ?? []
+        }
+
+        func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
+            guard !applying, let first = tableView.sortDescriptors.first, let key = first.key,
+                  let column = DetailsColumn(rawValue: key) else { return }
+            parent.sortOrder = [column.comparator(ascending: first.ascending)]
+        }
+
+        // MARK: Actions
+
+        @objc func doubleClicked(_ sender: NSTableView) {
+            let row = sender.clickedRow
+            guard rows.indices.contains(row) else { return }
+            parent.open(rows[row])
+        }
+
+        func pressed(_ key: DetailsTableView.Key, row: Int) {
+            guard rows.indices.contains(row) else { return }
+            switch key {
+            case .open: parent.open(rows[row])
+            case .quickLook: parent.quickLook(rows[row])
+            }
+        }
+
+        func makeMenu() -> NSMenu {
+            let menu = NSMenu()
+            menu.delegate = self
+            rowMenu = menu
+            return menu
+        }
+
+        /// Right-click on the column titles: show or hide columns.
+        func makeHeaderMenu() -> NSMenu {
+            let menu = NSMenu()
+            menu.delegate = self
+            headerMenu = menu
+            return menu
+        }
+
+        func menuNeedsUpdate(_ menu: NSMenu) {
+            menu.removeAllItems()
+            guard let table else { return }
+            if menu === headerMenu {
+                for column in DetailsColumn.allCases where column != .name {
+                    guard let tableColumn = table.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier(column.rawValue))
+                    else { continue }
+                    let item = DetailsMenuItem(column.title) { [weak self, weak tableColumn] in
+                        tableColumn?.isHidden.toggle()
+                        self?.saveHiddenColumns()
+                    }
+                    item.state = tableColumn.isHidden ? .off : .on
+                    menu.addItem(item)
+                }
+                return
+            }
+            let row = table.clickedRow >= 0 ? table.clickedRow : table.selectedRow
+            guard rows.indices.contains(row) else { return }
+            let item = rows[row]
+            let parent = self.parent
+            if item.isFolder {
+                menu.addItem(DetailsMenuItem("Show Contents") { parent.showContents(item) })
+                menu.addItem(.separator())
+            }
+            menu.addItem(DetailsMenuItem("Reveal in Finder") { FileActions.reveal(item.id) })
+            menu.addItem(DetailsMenuItem("Open") { FileActions.open(item.id) })
+            menu.addItem(DetailsMenuItem("Quick Look") { parent.quickLook(item) })
+            menu.addItem(DetailsMenuItem("Copy Path") { FileActions.copyPath(item.id) })
+            menu.addItem(.separator())
+            menu.addItem(DetailsMenuItem("Move to Trash…") { parent.trash(item) })
+        }
+
+        private func saveHiddenColumns() {
+            guard let table else { return }
+            let hidden = table.tableColumns.filter(\.isHidden).map(\.identifier.rawValue)
+            UserDefaults.standard.set(hidden, forKey: DetailsTable.hiddenColumnsKey)
+        }
+    }
+}
+
+/// The table behind Details: Return opens the selected item and Space shows it in Quick Look.
+final class DetailsTableView: NSTableView {
+    enum Key { case open, quickLook }
+    var onKey: ((Key, Int) -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        let row = selectedRow
+        if row >= 0, event.modifierFlags.intersection([.command, .option, .control]).isEmpty {
+            switch event.charactersIgnoringModifiers {
+            case " ":
+                onKey?(.quickLook, row)
+                return
+            case "\r", "\u{3}":                     // Return, Enter
+                onKey?(.open, row)
+                return
+            default:
+                break
+            }
+        }
+        super.keyDown(with: event)
+    }
+}
+
+/// A menu item that runs a closure.
+private final class DetailsMenuItem: NSMenuItem {
+    private let run: @MainActor () -> Void
+
+    init(_ title: String, run: @escaping @MainActor () -> Void) {
+        self.run = run
+        super.init(title: title, action: #selector(runAction), keyEquivalent: "")
+        target = self
+    }
+
+    required init(coder: NSCoder) {
+        fatalError("DetailsMenuItem is created in code")
+    }
+
+    @MainActor @objc private func runAction() { run() }
+}
+
+// MARK: - Cells
+
+private let detailsTextHeight: CGFloat = 17
+
+/// One line of text, left or right aligned (numbers use digits of equal width).
+final class DetailsTextCell: NSTableCellView {
+    private let label = NSTextField(labelWithString: "")
+
+    init(alignment: NSTextAlignment) {
+        super.init(frame: .zero)
+        label.alignment = alignment
+        label.lineBreakMode = .byTruncatingTail
+        label.font = alignment == .right
+            ? .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+            : .systemFont(ofSize: NSFont.systemFontSize)
+        addSubview(label)
+        textField = label
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("DetailsTextCell is created in code")
+    }
+
+    func show(_ text: String) {
+        label.stringValue = text
+    }
+
+    override func layout() {
+        super.layout()
+        label.frame = NSRect(x: 2, y: (bounds.height - detailsTextHeight) / 2,
+                             width: max(0, bounds.width - 4), height: detailsTextHeight)
+    }
+}
+
+/// The icon and name of a file or folder.
+final class DetailsNameCell: NSTableCellView {
+    private let icon = NSImageView()
+    private let label = NSTextField(labelWithString: "")
+
+    init() {
+        super.init(frame: .zero)
+        icon.imageScaling = .scaleProportionallyDown
+        label.lineBreakMode = .byTruncatingMiddle
+        label.font = .systemFont(ofSize: NSFont.systemFontSize)
+        addSubview(icon)
+        addSubview(label)
+        imageView = icon
+        textField = label
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("DetailsNameCell is created in code")
+    }
+
+    func show(_ item: DetailItem) {
+        icon.image = IconCache.icon(for: item)
+        label.stringValue = item.name
+        label.textColor = item.unreadable ? .secondaryLabelColor : .labelColor
+    }
+
+    override func layout() {
+        super.layout()
+        icon.frame = NSRect(x: 2, y: (bounds.height - 16) / 2, width: 16, height: 16)
+        label.frame = NSRect(x: 24, y: (bounds.height - detailsTextHeight) / 2,
+                             width: max(0, bounds.width - 26), height: detailsTextHeight)
+    }
+}
+
+/// How a folder changed since the earlier scan: an arrow and the amount, coloured by direction,
+/// with the details in a tooltip (as in History).
+final class DetailsChangeCell: NSTableCellView {
+    private let icon = NSImageView()
+    private let label = NSTextField(labelWithString: "")
+    @MainActor private static var symbols: [String: NSImage] = [:]
+
+    init() {
+        super.init(frame: .zero)
+        icon.imageScaling = .scaleProportionallyDown
+        label.lineBreakMode = .byTruncatingTail
+        label.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        addSubview(icon)
+        addSubview(label)
+        textField = label
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("DetailsChangeCell is created in code")
+    }
+
+    func show(_ change: FolderChange?, settings: DisplaySettings, since: String) {
+        guard let change else {
+            icon.image = nil
+            label.stringValue = ""
+            toolTip = nil
+            return
+        }
+        if change.kind != .added && change.kind != .renamed && change.change == 0 {
+            icon.image = nil
+            label.stringValue = "–"
+            label.textColor = .tertiaryLabelColor
+            toolTip = "No change since \(since)"
+            needsLayout = true
+            return
+        }
+        let color = NSColor(Theme.changeColor(change.change))
+        icon.image = Self.symbol(Theme.changeSymbol(change.change))
+        icon.contentTintColor = color
+        label.textColor = color
+        label.stringValue = settings.signedBytes(change.change)
+        switch change.kind {
+        case .added:
+            toolTip = "New since \(since)"
+        case .renamed:
+            toolTip = "Called “\(change.oldName ?? "")” on \(since), when it took \(settings.bytes(change.before))"
+        default:
+            toolTip = "\(settings.bytes(change.before)) on \(since)"
+        }
+        needsLayout = true
+    }
+
+    private static func symbol(_ name: String) -> NSImage? {
+        if let image = symbols[name] { return image }
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 11, weight: .medium))
+        symbols[name] = image
+        return image
+    }
+
+    override func layout() {
+        super.layout()
+        let iconWidth: CGFloat = icon.image == nil ? 0 : 14
+        icon.frame = NSRect(x: 2, y: (bounds.height - 14) / 2, width: iconWidth, height: 14)
+        let x: CGFloat = icon.image == nil ? 2 : 20
+        label.frame = NSRect(x: x, y: (bounds.height - detailsTextHeight) / 2,
+                             width: max(0, bounds.width - x - 2), height: detailsTextHeight)
+    }
+}
+
+/// A share of the folder: a small bar and the percentage.
+final class DetailsPercentCell: NSTableCellView {
+    private let track = TrackView()
+    private let bar = GradientBar()
+    private let label = NSTextField(labelWithString: "")
+    private var fraction: CGFloat = 0
+
+    init() {
+        super.init(frame: .zero)
+        label.alignment = .right
+        label.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        label.textColor = .secondaryLabelColor
+        addSubview(track)
+        addSubview(bar)
+        addSubview(label)
+        textField = label
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("DetailsPercentCell is created in code")
+    }
+
+    func show(fraction: Double, settings: DisplaySettings) {
+        self.fraction = CGFloat(min(1, max(0, fraction)))
+        bar.setColors(settings.barStart, settings.barEnd)
+        bar.isHidden = self.fraction <= 0
+        label.stringValue = SizeFormat.percent(fraction, decimals: 1)
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        let labelWidth: CGFloat = 52
+        let barHeight: CGFloat = 6
+        let barWidth = max(0, bounds.width - labelWidth - 10)
+        let y = (bounds.height - barHeight) / 2
+        track.frame = NSRect(x: 2, y: y, width: barWidth, height: barHeight)
+        let filled = fraction > 0 ? max(barHeight, (barWidth * fraction).rounded()) : 0
+        bar.frame = NSRect(x: 2, y: y, width: min(barWidth, filled), height: barHeight)
+        label.frame = NSRect(x: bounds.width - labelWidth - 2, y: (bounds.height - detailsTextHeight) / 2,
+                             width: labelWidth, height: detailsTextHeight)
     }
 }

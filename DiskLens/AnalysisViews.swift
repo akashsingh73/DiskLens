@@ -463,7 +463,6 @@ struct ChangesList: View {
     let settings: DisplaySettings
 
     @StateObject private var state = ChangesState()
-    @AppStorage("detailTab") private var tab: DetailTab = .details
 
     var body: some View {
         if let comparison = model.changes, let scan = model.result {
@@ -628,7 +627,7 @@ struct ChangesList: View {
     private func show(_ change: FolderChange, scan: ScanResult) {
         guard let node = folder(for: change, scan: scan) else { return }
         model.navigate(to: node)
-        tab = .details
+        model.tab = .details
     }
 }
 

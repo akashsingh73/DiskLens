@@ -263,6 +263,10 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
 enum HistoryStore {
     private static let limit = 5000
 
+    /// Posted (on the main thread) after a window adds a scan to the history; the object is that
+    /// window's `AppModel`. Other windows refresh their recent scans and History.
+    static let didChange = Notification.Name("DiskLens.HistoryStore.didChange")
+
     /// Where DiskLens keeps its scan history (and the folder snapshots, see `SnapshotStore`).
     static var folderURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first

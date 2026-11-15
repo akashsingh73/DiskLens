@@ -2,7 +2,7 @@ import SwiftUI
 
 /// The Settings window (DiskLens ▸ Settings…, ⌘,).
 struct SettingsView: View {
-    @EnvironmentObject private var model: AppModel
+    @StateObject private var access = AccessCheck()
     private var prefs = DisplayPrefs()
 
     @AppStorage(Prefs.treemapDepth) private var treemapDepth: Int = 6
@@ -112,10 +112,10 @@ struct SettingsView: View {
 
             LabeledContent("Full Disk Access") {
                 HStack {
-                    Text(model.fullDiskAccess ? "On" : "Off")
-                        .foregroundStyle(model.fullDiskAccess ? Color.green : Color.orange)
+                    Text(access.granted ? "On" : "Off")
+                        .foregroundStyle(access.granted ? Color.green : Color.orange)
                     Button("Open Privacy Settings") { FullDiskAccess.openSettings() }
-                    Button("Check Again") { model.fullDiskAccess = FullDiskAccess.isGranted }
+                    Button("Check Again") { access.granted = FullDiskAccess.isGranted }
                 }
             }
             Text("After turning it on, quit and reopen DiskLens.")
@@ -131,4 +131,10 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
     }
+}
+
+/// Whether DiskLens has Full Disk Access, for the Settings window (the same for every window).
+/// A class so the app builds without SwiftUI's macros.
+private final class AccessCheck: ObservableObject {
+    @Published var granted = FullDiskAccess.isGranted
 }

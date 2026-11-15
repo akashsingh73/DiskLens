@@ -109,6 +109,7 @@ ad-hoc signature, so use `build.sh` for the copy you keep in Applications.
 | To | Do this |
 | --- | --- |
 | Scan | ⌘O to choose a folder (or drop one onto the window), ⇧⌘H for your home folder, ⌘R to rescan, ⌘. to stop |
+| Scan several things at once | ⌘N for a new window: each window has its own scan, view and Back / Forward |
 | Open a folder | Double-click it (or select it and press Return) in Details or the Treemap, or click it in the tree or the chart legend |
 | Go back up | Click any folder in the path bar above the views, or press ⌘↑ |
 | Back / Forward | The arrow buttons at the top left, ⌘[ and ⌘], or the side buttons on your mouse |
@@ -194,10 +195,13 @@ A few rules keep DiskLens stable; please keep to them:
   ("pieces", see `ScanEngine.stream`) and the main thread fills them in with `ScanResult.fillIn`.
 - **Speed**: a few workers share a queue of folders; a busy worker hands subfolders to idle ones (`WorkQueue`),
   so lopsided folders don't leave workers idle. There are at most six (`ScanEngine.readers`): reading folders is
-  almost all work inside macOS's file system, where more threads only wait on each other. Sorting table rows goes
+  almost all work inside macOS's file system, where more threads only wait on each other. Scans in different
+  windows take turns at the same disk's readers (`DiskReaders`). Sorting table rows goes
   through `FastSort`, not `sorted(using:)`. Measure before and after any change to the scanner.
 - **Never wait on the cloud during a scan**: scan threads run with cloud fetching turned off (`CloudFiles`).
-- **Big folders stay responsive**: Details lists at most the 50,000 largest files of a folder, "Expand All
+- **Big folders stay responsive**: Details and the folder tree are AppKit tables, which only make the rows on
+  screen, so a folder of 63,000 files lists in about a third of a second (SwiftUI's `Table` froze the window for
+  over two seconds at 50,000 rows); keep them that way. "Expand All
   Below" stops after a few thousand folders, and search keeps only the 500 largest matches and reads folders on
   background threads, stopping as soon as the text changes.
 

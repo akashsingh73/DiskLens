@@ -90,6 +90,42 @@ struct DiskLensTests {
         c.equal(live.topFiles.map(\.path), whole.topFiles.map(\.path), "same largest files")
         c.equal(live.hardLinkDuplicates, whole.hardLinkDuplicates, "same extra hard links")
 
+        c.section("Scans in several windows at once")
+        c.expect(DiskReaders.slots(for: UInt64.max - 1) === DiskReaders.slots(for: UInt64.max - 1),
+                 "scans of the same disk share its readers")
+        c.expect(DiskReaders.slots(for: UInt64.max - 1) !== DiskReaders.slots(for: UInt64.max - 2),
+                 "scans of different disks don't")
+        let together = ResultSlots<ScanResult>(count: 3)
+        DispatchQueue.concurrentPerform(iterations: 3) { index in
+            if case .finished(let result) = ScanEngine.scan(path: f.root, displayName: "Fixture", topCount: 10,
+                                                            progress: ScanProgress()) {
+                together.set(index, result)
+            }
+        }
+        let results = together.all()
+        c.equal(results.count, 3, "three scans of the same folder at once all finish")
+        for (index, result) in results.enumerated() {
+            c.equal(result.root.allocated, whole.root.allocated, "scan \(index + 1): same space on disk as one alone")
+            c.equal(result.root.fileCount, whole.root.fileCount, "scan \(index + 1): same files")
+            c.equal(result.root.folderCount, whole.root.folderCount, "scan \(index + 1): same folders")
+        }
+        // Another scan of the same disk holds every reader: stopping this one still stops it at once.
+        var rootStat = Darwin.stat()
+        lstat(f.root, &rootStat)
+        let busy = DiskReaders.slots(for: FileFacts(rootStat).device)
+        for _ in 0..<ScanEngine.readers { busy.wait() }
+        let stopping = ScanProgress()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) { stopping.cancel() }
+        let started = Date()
+        let waitingOutcome = ScanEngine.scan(path: f.root, displayName: "Fixture", topCount: 10, progress: stopping)
+        let waited = Date().timeIntervalSince(started)
+        for _ in 0..<ScanEngine.readers { busy.signal() }
+        if case .cancelled = waitingOutcome {
+            c.expect(waited < 2, "a scan waiting for the disk's readers stops when told to (took \(waited) s)")
+        } else {
+            c.fail("a scan stopped while waiting for the disk's readers should end as stopped")
+        }
+
         c.section("Reading a cloud folder after the scan")
         // Turn folder "big" into a placeholder the way a folder only in the cloud looks after a scan,
         // then read it the way DiskLens reads cloud folders, and check it fills back in. ("big" has

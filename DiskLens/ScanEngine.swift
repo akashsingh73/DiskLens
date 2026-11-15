@@ -73,11 +73,18 @@ enum ScanEngine {
     private static func runWorkers(_ queue: WorkQueue, workers: Int, rootDevice: UInt64, links: HardLinkRegistry,
                                    topCount: Int, now: Int64, progress: ScanProgress, fetchCloud: Bool,
                                    deliver: @escaping @Sendable (ScanPiece) -> Void) {
+        // Reading from the disk, scans of the same disk (one per window) take turns at its readers.
+        // Reading from the cloud waits on the internet instead, so it doesn't.
+        let slots = fetchCloud ? nil : DiskReaders.slots(for: rootDevice)
         DispatchQueue.concurrentPerform(iterations: workers) { _ in
             func work() {
                 while let job = queue.next() {
                     defer { queue.finished() }
                     if progress.isCancelled {
+                        queue.stop()
+                        continue
+                    }
+                    if let slots, !take(slots, unlessStopped: progress) {
                         queue.stop()
                         continue
                     }
@@ -87,6 +94,7 @@ enum ScanEngine {
                     var acc = ScanAccumulator(topCount: topCount)
                     scanBranch(path: folder.path, root: contents, rootDevice: rootDevice, acc: &acc, links: links,
                                progress: progress, now: now, fetchCloud: fetchCloud, split: queue)
+                    slots?.signal()
                     if contents.cloudOnly {
                         acc.cloudFolders.append(CloudFolder(path: folder.path, name: folder.name, node: folder.node))
                     }
@@ -98,6 +106,14 @@ enum ScanEngine {
             }
             if fetchCloud { work() } else { CloudFiles.withoutFetching(work) }
         }
+    }
+
+    /// Waits for a free reader of the disk; false if the scan is stopped first.
+    private static func take(_ slots: DispatchSemaphore, unlessStopped progress: ScanProgress) -> Bool {
+        while slots.wait(timeout: .now() + .milliseconds(100)) == .timedOut {
+            if progress.isCancelled { return false }
+        }
+        return true
     }
 
     private static func streamLocally(path: String, displayName: String, topCount: Int, progress: ScanProgress,
@@ -399,5 +415,25 @@ enum ScanEngine {
     @inline(__always)
     private static func entryName(_ entry: UnsafeMutablePointer<FTSENT>) -> String {
         String(decoding: entryNameBuffer(entry), as: UTF8.self)
+    }
+}
+
+/// The readers of each disk, shared by every scan of it. Each window can run a scan of its own:
+/// two scans of the same disk take turns at its `ScanEngine.readers` instead of each starting that
+/// many, which would only make them wait on each other inside macOS. Scans of different disks
+/// (the Mac and an external drive, say) don't wait for each other.
+enum DiskReaders {
+    private static let lock = NSLock()
+    /// One semaphore per disk scanned since DiskLens opened; kept, since a semaphore must not be
+    /// freed while a scan holds part of it.
+    nonisolated(unsafe) private static var byDisk: [UInt64: DispatchSemaphore] = [:]
+
+    static func slots(for device: UInt64) -> DispatchSemaphore {
+        lock.lock()
+        defer { lock.unlock() }
+        if let slots = byDisk[device] { return slots }
+        let slots = DispatchSemaphore(value: ScanEngine.readers)
+        byDisk[device] = slots
+        return slots
     }
 }
