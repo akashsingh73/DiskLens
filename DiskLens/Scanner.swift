@@ -676,9 +676,14 @@ extension FileTally {
             for index in stride(from: reader, to: folders.count, by: readers) {
                 if progress.isCancelled { break }
                 let folder = folders[index]
-                for file in FolderReader.files(in: folder.path, uncounted: folder.uncounted) ?? [] where file.counted {
-                    tally.add(ext: NameTools.fileExtension(of: file.name), size: file.facts.size,
-                              allocated: file.facts.allocated, modified: file.facts.modified, now: now)
+                // Batch by batch: a big folder stops as soon as the count is cancelled, and a folder
+                // whose reading fails partway still counts the files read.
+                FolderReader.files(in: folder.path, uncounted: folder.uncounted) { batch in
+                    for file in batch where file.counted {
+                        tally.add(ext: NameTools.fileExtension(of: file.name), size: file.facts.size,
+                                  allocated: file.facts.allocated, modified: file.facts.modified, now: now)
+                    }
+                    return !progress.isCancelled
                 }
             }
             slots.set(reader, tally)

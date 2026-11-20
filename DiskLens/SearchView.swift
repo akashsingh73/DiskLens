@@ -45,6 +45,8 @@ final class SearchModel: ObservableObject {
     /// The folders' nodes in index order, for turning a hit back into a folder.
     private var nodes: [Node] = []
     private var indexKey: IndexKey?
+    /// The index the results shown were found in: they point at folders by their place in it.
+    private var hitsIndex: IndexKey?
     private var resultsKey: ResultsKey?
     private var folderHits = LargestHits(capacity: 0, bySize: false)
     private var topFileHits = LargestHits(capacity: 0, bySize: false)
@@ -132,7 +134,8 @@ final class SearchModel: ObservableObject {
     /// Goes to a result: its folder, or for a file the folder it is in, with the file selected in Details.
     func choose(_ hit: SearchHit) {
         guard let app, let result = app.result,
-              indexKey == IndexKey(result: ObjectIdentifier(result), version: app.version) else {
+              indexKey == IndexKey(result: ObjectIdentifier(result), version: app.version),
+              hitsIndex == indexKey else {
             refresh(debounce: false)
             return
         }
@@ -184,6 +187,7 @@ final class SearchModel: ObservableObject {
         guard !Task.isCancelled else { return }
         folderHits = quick.0
         topFileHits = quick.1
+        hitsIndex = key.index
         searching = false
         publish(nil, bySize: bySize)
 
@@ -231,9 +235,9 @@ final class SearchModel: ObservableObject {
         guard let app, let result = app.result else { return nil }
         let key = IndexKey(result: ObjectIdentifier(result), version: app.version)
         if key != indexKey || index == nil {
-            if index != nil {
-                // Results point at folders by their place in the index, and the tree has changed
-                // (something moved to the Trash shifts every folder after it): drop the old ones
+            if let shown = hitsIndex, shown != key {
+                // The results kept from last time were found in another version of the tree, and
+                // something moved to the Trash shifts every folder after it in the index: drop them
                 // rather than let them open the wrong folder. The search runs again (`refresh`).
                 folderHits = LargestHits(capacity: 0, bySize: false)
                 topFileHits = LargestHits(capacity: 0, bySize: false)
@@ -261,6 +265,7 @@ final class SearchModel: ObservableObject {
 
     private func clearResults() {
         hits = []
+        hitsIndex = nil
         folderMatches = 0
         fileMatches = 0
         filesComplete = false

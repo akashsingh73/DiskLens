@@ -512,7 +512,9 @@ struct DiskLensTests {
                                                                                 date: later, opening: unreadBase))
         c.equal(unread.removed, 0, "folders not read this time aren't taken for removed ones")
         c.equal(unread.change(at: "evicted")?.change, -400, "one now only in the cloud shows the space it freed")
-        c.equal(unread.change(at: "unread")?.change, 0, "one not read (a scan stopped early) is taken as unchanged")
+        c.equal(unread.change(at: "unread")?.change, -300, "one still being read counts what the tree has for it")
+        c.expect(!unread.changes.contains { $0.kind == .files },
+                 "so the folder's loose files still add up (no change shows there)")
 
         c.section("Part of an earlier scan")
         if let part = base.part(at: "/scan/a") {
@@ -589,6 +591,21 @@ struct DiskLensTests {
         try? future.write(to: url)
         c.equal(store.record(make("/scan", 7, 1)), [], "a file from a newer DiskLens gives nothing to compare with")
         c.equal(try? Data(contentsOf: url), future, "and is left as it was")
+
+        // A scan of the startup disk is kept under the data volume's path, and has "/Users" as
+        // "/System/Volumes/Data/Users". A later first scan of /Users is compared with that part.
+        if FileManager.default.fileExists(atPath: "/System/Volumes/Data/Users") {
+            try? FileManager.default.removeItem(at: url)
+            let disk = FolderSnapshot(path: "/System/Volumes/Data", date: earlier.addingTimeInterval(8 * 86_400),
+                                      allocated: 100, children: ["": ["Users": 90], "Users": ["Shared": 40]])
+            c.equal(store.record(disk), [], "a scan of the startup disk")
+            let users = FolderSnapshot(path: "/Users", date: earlier.addingTimeInterval(9 * 86_400),
+                                       allocated: 95, children: ["": ["Shared": 45]])
+            let bases = store.record(users)
+            c.equal(bases.map(\.path), ["/Users"], "a later first scan of /Users is compared with its part of it")
+            c.equal(bases.first?.children[""], ["Shared": 40], "with what that scan found in it")
+            c.equal(bases.first?.partOf, "/System/Volumes/Data", "and says which scan it came from")
+        }
     }
 
     /// Scans a folder, changes it, scans it again and compares, the way the app does.

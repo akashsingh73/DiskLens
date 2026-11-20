@@ -101,12 +101,10 @@ struct FolderSnapshot: Codable, Equatable, Sendable {
             sizes.reserveCapacity(node.children.count)
             for child in node.children {
                 if child.cloudOnly || child.pending {
-                    // Not read this time, but still there: not "removed". A folder now only in the
-                    // cloud takes (almost) no space here, which shows as shrinking; one not read
-                    // (a scan stopped early) is taken as unchanged.
-                    if let before = earlier.children[folder]?[child.name] {
-                        sizes[child.name] = child.cloudOnly ? child.allocated : before
-                    }
+                    // Not read (only in the cloud, or still being read), but still there: not
+                    // "removed". It counts with the space the tree gives it now (almost none), as in
+                    // its folder's total, so the folder's loose files still add up.
+                    if earlier.children[folder]?[child.name] != nil { sizes[child.name] = child.allocated }
                     continue
                 }
                 sizes[child.name] = child.allocated

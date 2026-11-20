@@ -330,14 +330,6 @@ struct DetailsView: View {
                                              ownAllocated: directory.ownAllocated,
                                              uncountedLinks: uncounted?.values.reduce(0, +) ?? 0)
         state.signatureToShow = signature
-        if let cached = state.cachedFiles, cached.key == filesKey {
-            state.show(folderRows + DetailLoader.withPercents(cached.listing.items, of: total))
-            state.finishLoading()
-            state.listedFolder = path
-            state.shownSignature = signature
-            showPendingFile()
-            return
-        }
         if state.isReading(filesKey) {
             // Still being read: show the new folder rows with the files so far, and let it finish.
             // (Starting over on every redraw, twice a second during a scan, a big folder would
@@ -346,7 +338,16 @@ struct DetailsView: View {
             state.show(folderRows + state.filesSoFar)
             return
         }
+        // Whatever else is being read (another folder) would otherwise go on showing its rows here.
         state.cancelReading()
+        if let cached = state.cachedFiles, cached.key == filesKey {
+            state.show(folderRows + DetailLoader.withPercents(cached.listing.items, of: total))
+            state.finishLoading()
+            state.listedFolder = path
+            state.shownSignature = signature
+            showPendingFile()
+            return
+        }
         state.show(folderRows)
         guard directory.ownFileCount > 0, !directory.unreadable else {
             state.finishLoading()
@@ -478,25 +479,35 @@ final class DetailsState: ObservableObject {
                 inbox.finish()
                 return complete
             }
-            var files: [DetailItem] = []
             var shown = Date.distantPast
+            var counted = Date.distantPast
             var showTime: TimeInterval = 0
             for await rows in arrivals {
-                guard let self else { return }
-                files += rows
-                self.filesSoFar = files
-                self.filesRead = files.count
-                // Redraw a few times a second; less often when sorting all the rows takes a while.
-                if Date().timeIntervalSince(shown) >= max(0.25, showTime * 4) {
-                    let start = Date()
-                    self.show(self.folderRowsWhileReading + files)
-                    showTime = Date().timeIntervalSince(start)
+                // A stream hands over what it already holds even after its task is cancelled:
+                // a read that was replaced must not show its rows in place of the new folder's.
+                guard let self, !Task.isCancelled else { return }
+                // Appended in place: a second copy of the array (a local one, say) would make
+                // every batch copy all the rows read so far.
+                self.filesSoFar += rows
+                let now = Date()
+                if now.timeIntervalSince(shown) >= max(0.25, showTime * 4) {
+                    // Redraw a few times a second; less often when sorting all the rows takes a while.
+                    self.filesRead = self.filesSoFar.count
+                    self.show(self.folderRowsWhileReading + self.filesSoFar)
+                    showTime = Date().timeIntervalSince(now)
                     shown = Date()
+                    counted = shown
+                } else if now.timeIntervalSince(counted) >= 0.1 {
+                    // The count on the progress bar. Each change redraws the view, so not for every
+                    // batch: with the Mac busy, redrawing for every batch made reading crawl.
+                    self.filesRead = self.filesSoFar.count
+                    counted = now
                 }
             }
             let complete = await reader.value
             guard let self, !Task.isCancelled else { return }
             self.reading = nil
+            let files = self.filesSoFar
             self.filesSoFar = []
             // The folder's size may have changed while its files were read (a scan filling in).
             let listed = DetailLoader.withPercents(files, of: folder.allocated)
