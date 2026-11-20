@@ -129,6 +129,96 @@ enum FastSort {
         }
         return order.map { rows[$0] }
     }
+
+    /// Two lists of rows, each sorted in `order`, as one: the order sorting `rows + more` would give,
+    /// with `rows` first where they tie. Where each of `more` goes is found by galloping through
+    /// `rows`, so a few new rows among many take a few comparisons, not one per row; the rows are
+    /// copied once. (A list growing while it is read is kept sorted this way, rather than sorted
+    /// again in full each time it is shown.)
+    static func merged<Row>(_ rows: [Row], _ more: [Row], in order: RowOrder<Row>) -> [Row] {
+        if more.isEmpty { return rows }
+        if rows.isEmpty { return more }
+        var result: [Row] = []
+        result.reserveCapacity(rows.count + more.count)
+        var start = 0
+        for row in more {
+            // The rows `row` doesn't come before stay in front of it, ties included.
+            let end = firstIndex(from: start, to: rows.count) { order.precedes(row, rows[$0]) }
+            result.append(contentsOf: rows[start..<end])
+            result.append(row)
+            start = end
+        }
+        result.append(contentsOf: rows[start...])
+        return result
+    }
+
+    /// The first index in `start..<end` where `isPast` holds (`end` if none), for a test that, once
+    /// it holds, holds for every later index, as "comes after this row" does in a sorted list.
+    /// Looks 1, 2, 4, 8… ahead, then halves the last step: a nearby answer takes few looks.
+    static func firstIndex(from start: Int, to end: Int, where isPast: (Int) -> Bool) -> Int {
+        var low = start      // Everything before `low` is known not to be past.
+        var probe = start
+        var step = 1
+        while probe < end, !isPast(probe) {
+            low = probe + 1
+            probe = low + step
+            step *= 2
+        }
+        var high = min(probe, end)
+        while low < high {
+            let middle = low + (high - low) / 2
+            if isPast(middle) { high = middle } else { low = middle + 1 }
+        }
+        return low
+    }
+}
+
+/// The order of a list of `KeyPathComparator`s, for comparing two rows at a time (merging sorted
+/// lists, finding where a row goes in one) the way `FastSort` compares them: the same values,
+/// names compared the same way, and ties left as they are.
+struct RowOrder<Row: FastSortable> {
+    private enum Key {
+        case integer((Row) -> Int64)
+        case real((Row) -> Double)
+        case text((Row) -> String)
+        /// A column `FastSort` has no key for, compared through its key path (in its own order).
+        case other(KeyPathComparator<Row>)
+    }
+
+    private let keys: [(key: Key, ascending: Bool)]
+
+    init(_ comparators: [KeyPathComparator<Row>]) {
+        keys = comparators.map { comparator in
+            let ascending = comparator.order == .forward
+            switch Row.sortKey(for: comparator.keyPath) {
+            case .integer(let value): return (.integer(value), ascending)
+            case .real(let value): return (.real(value), ascending)
+            case .text(let value): return (.text(value), ascending)
+            case nil: return (.other(comparator), true)
+            }
+        }
+    }
+
+    /// Whether `a` comes before `b`. False when they tie: a stable sort keeps those as they came.
+    func precedes(_ a: Row, _ b: Row) -> Bool {
+        for (key, ascending) in keys {
+            let result: ComparisonResult
+            switch key {
+            case .integer(let value):
+                let (x, y) = (value(a), value(b))
+                result = x < y ? .orderedAscending : x > y ? .orderedDescending : .orderedSame
+            case .real(let value):
+                let (x, y) = (value(a), value(b))
+                result = x < y ? .orderedAscending : x > y ? .orderedDescending : .orderedSame
+            case .text(let value):
+                result = value(a).localizedStandardCompare(value(b))
+            case .other(let comparator):
+                result = comparator.compare(a, b)
+            }
+            if result != .orderedSame { return result == (ascending ? .orderedAscending : .orderedDescending) }
+        }
+        return false
+    }
 }
 
 // MARK: - Paths as Finder shows them

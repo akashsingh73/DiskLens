@@ -75,15 +75,6 @@ enum DetailLoader {
         return Listing(items: items, total: items.count)
     }
 
-    /// The rows with "% of Parent" worked out again for a folder now holding `total` bytes.
-    static func withPercents(_ items: [DetailItem], of total: Int64) -> [DetailItem] {
-        items.map { item in
-            var copy = item
-            copy.percent = total > 0 ? Double(item.allocated) / Double(total) : 0
-            return copy
-        }
-    }
-
     /// Lists a folder's files like `listFiles`, handing each batch of rows over as soon as it is read
     /// (a few thousand at a time), so nothing already read waits behind a slow drive. `deliver` runs
     /// on this thread and returns false to stop. False if the folder can't be read, or reading it
@@ -115,6 +106,23 @@ enum DetailLoader {
         }
         // Every file is listed: the table only makes the rows on screen, however many there are.
         return readable
+    }
+}
+
+/// Rows read on another thread, waiting for the main thread to take them, all at once.
+final class DetailInbox: Sendable {
+    private let rows = OSAllocatedUnfairLock(initialState: [DetailItem]())
+
+    func add(_ new: [DetailItem]) {
+        rows.withLock { $0 += new }
+    }
+
+    func takeAll() -> [DetailItem] {
+        rows.withLock { waiting in
+            let all = waiting
+            waiting = []
+            return all
+        }
     }
 }
 
@@ -268,7 +276,7 @@ struct DetailsView: View {
     private func showPendingFile() {
         guard let target = model.fileToHighlight,
               state.listedFolder == (target as NSString).deletingLastPathComponent else { return }
-        if state.rows.contains(where: { $0.id == target }) {
+        if state.rows.row(of: target, near: 0) != nil {
             state.selection = [target]
             state.scrollTarget = target
         }
@@ -333,22 +341,22 @@ struct DetailsView: View {
         if state.isReading(filesKey) {
             // Still being read: show the new folder rows with the files so far, and let it finish.
             // (Starting over on every redraw, twice a second during a scan, a big folder would
-            // never get listed.)
-            state.folderRowsWhileReading = folderRows
-            state.show(folderRows + state.filesSoFar)
+            // never get listed.) Only the folder rows are sorted again; the files stay as they are.
+            state.show(folders: folderRows, total: total)
             return
         }
         // Whatever else is being read (another folder) would otherwise go on showing its rows here.
         state.cancelReading()
-        if let cached = state.cachedFiles, cached.key == filesKey {
-            state.show(folderRows + DetailLoader.withPercents(cached.listing.items, of: total))
+        if let listed = state.cachedFiles, listed.key == filesKey {
+            // While a scan fills in, this is the same folder redrawn: only its folder rows changed.
+            state.show(folders: folderRows, listed: listed, total: total)
             state.finishLoading()
             state.listedFolder = path
             state.shownSignature = signature
             showPendingFile()
             return
         }
-        state.show(folderRows)
+        state.show(folders: folderRows, files: [], total: total)
         guard directory.ownFileCount > 0, !directory.unreadable else {
             state.finishLoading()
             state.listedFolder = path
@@ -362,7 +370,7 @@ struct DetailsView: View {
         try? await Task.sleep(nanoseconds: 120_000_000)
         if Task.isCancelled { return }
 
-        state.startReading(filesKey, path: path, folder: directory, folderRows: folderRows,
+        state.startReading(filesKey, path: path, folder: directory,
                            uncounted: uncounted) { @MainActor in showPendingFile() }
     }
 }
@@ -405,18 +413,99 @@ struct FractionBar: Shape {
     }
 }
 
+/// The Details rows in display order, kept as two sorted lists, the folder's subfolders and its
+/// files, instead of one merged array. While a scan fills in, the subfolders change twice a second;
+/// this way that costs nothing for the files, however many there are (copying and sorting 300,000
+/// of them every time kept the window busy). "% of Parent" is worked out from the folder's total as
+/// a row is read, so a total that grew needs no pass over the files either.
+struct DetailRows: RandomAccessCollection {
+    /// The subfolders and the files, each sorted in the same order.
+    private var folders: [DetailItem] = []
+    private var files: [DetailItem] = []
+    /// How many files come before each folder.
+    private var filesBefore: [Int] = []
+    /// The folder's space on disk, which "% of Parent" is a share of.
+    private var total: Int64 = 0
+
+    init() {}
+
+    /// `folders` and `files`, each already sorted in `order`, in the order sorting `folders + files`
+    /// would give: where a folder and a file tie, the folder comes first.
+    init(folders: [DetailItem], files: [DetailItem], total: Int64, order: RowOrder<DetailItem>) {
+        self.folders = folders
+        self.files = files
+        self.total = total
+        filesBefore.reserveCapacity(folders.count)
+        var before = 0
+        for folder in folders {
+            let folder = withPercent(folder)
+            // Each folder comes after more files than the one before it: look on from there.
+            before = FastSort.firstIndex(from: before, to: files.count) {
+                !order.precedes(withPercent(files[$0]), folder)
+            }
+            filesBefore.append(before)
+        }
+    }
+
+    var startIndex: Int { 0 }
+    var endIndex: Int { folders.count + files.count }
+
+    subscript(row: Int) -> DetailItem {
+        let folder = foldersBefore(row)
+        if folder < folders.count, folder + filesBefore[folder] == row { return withPercent(folders[folder]) }
+        return withPercent(files[row - folder])
+    }
+
+    /// The row showing `id`: `hint` if it still does, otherwise wherever it moved to (nil if it isn't
+    /// shown). Rows mostly move a little, so the files are searched outward from the hint, comparing
+    /// names first (short, and different for every file in a folder).
+    func row(of id: String, near hint: Int) -> Int? {
+        if indices.contains(hint), self[hint].id == id { return hint }
+        if let folder = folders.firstIndex(where: { $0.id == id }) { return folder + filesBefore[folder] }
+        guard !files.isEmpty else { return nil }
+        let name = (id as NSString).lastPathComponent
+        let start = Swift.min(Swift.max(0, hint - foldersBefore(hint)), files.count - 1)
+        var distance = 0
+        while start - distance >= 0 || start + distance < files.count {
+            let after = start + distance
+            if after < files.count, files[after].name == name, files[after].id == id { return row(ofFile: after) }
+            let before = start - distance
+            if distance > 0, before >= 0, files[before].name == name, files[before].id == id {
+                return row(ofFile: before)
+            }
+            distance += 1
+        }
+        return nil
+    }
+
+    /// How many folders are on the rows before `row`.
+    private func foldersBefore(_ row: Int) -> Int {
+        FastSort.firstIndex(from: 0, to: folders.count) { $0 + filesBefore[$0] >= row }
+    }
+
+    private func row(ofFile index: Int) -> Int {
+        index + FastSort.firstIndex(from: 0, to: folders.count) { filesBefore[$0] > index }
+    }
+
+    private func withPercent(_ item: DetailItem) -> DetailItem {
+        var item = item
+        item.percent = total > 0 ? Double(item.allocated) / Double(total) : 0
+        return item
+    }
+}
+
 /// View state for DetailsView, kept in a class so it builds without SwiftUI's macros.
 final class DetailsState: ObservableObject {
     /// The rows in display order.
-    @Published private(set) var rows: [DetailItem] = [] {
+    @Published private(set) var rows = DetailRows() {
         didSet { rowsVersion += 1 }
     }
-    /// Changes whenever `rows` does, so the table reloads only then.
+    /// Changes whenever `rows` does, so the table updates only then.
     private(set) var rowsVersion = 0
     @Published var folderLookup: [String: Node] = [:]
     @Published var selection = Set<DetailItem.ID>()
     @Published var sortOrder = [KeyPathComparator(\DetailItem.allocated, order: .reverse)] {
-        didSet { rows = FastSort.sorted(items, using: sortOrder) }
+        didSet { sortAgain() }
     }
     @Published var previewURL: URL?
     /// A row to scroll to (a file chosen in search).
@@ -430,7 +519,7 @@ final class DetailsState: ObservableObject {
     /// The signature to record once the files being read are all listed (the latest redraw's).
     var signatureToShow: Signature?
     /// The files of the folder read last, reused while its own files stay the same.
-    var cachedFiles: (key: FilesKey, listing: DetailLoader.Listing)?
+    private(set) var cachedFiles: Listed?
 
     /// A folder's own files as the scan knows them: while this stays the same, so does the list.
     struct FilesKey: Equatable {
@@ -441,11 +530,30 @@ final class DetailsState: ObservableObject {
         let uncountedLinks: Int
     }
 
+    /// A folder's files as read, in reading order and sorted (showing them again in the same order
+    /// needs no sorting).
+    struct Listed {
+        let key: FilesKey
+        let files: [DetailItem]
+        var sorted: [DetailItem]
+        var sortOrder: [KeyPathComparator<DetailItem>]
+    }
+
+    // What `rows` is made of.
+    /// The folder's subfolders as the tree has them, and the same sorted.
+    private var folders: [DetailItem] = []
+    private var sortedFolders: [DetailItem] = []
+    /// The folder's files in reading order, and the same sorted. While they are being read, the ones
+    /// read since the last redraw are only in `files` (see `sortNewFiles`).
+    private var files: [DetailItem] = []
+    private var sortedFiles: [DetailItem] = []
+    /// The listing `files` holds in full; nil while it is being read, or if reading it failed.
+    private var filesKey: FilesKey?
+    /// The folder's space on disk, for "% of Parent".
+    private var total: Int64 = 0
+
     /// The read in progress, which outlives the view's redraws (see `startReading`).
     private var reading: (key: FilesKey, task: Task<Void, Never>)?
-    /// While reading: the folder rows to show with the files (updated on each redraw), and the files so far.
-    var folderRowsWhileReading: [DetailItem] = []
-    private(set) var filesSoFar: [DetailItem] = []
 
     func isReading(_ key: FilesKey) -> Bool { reading?.key == key }
 
@@ -453,70 +561,77 @@ final class DetailsState: ObservableObject {
     func cancelReading() {
         reading?.task.cancel()
         reading = nil
-        filesSoFar = []
     }
 
     /// Reads a folder's files on another thread and shows them as they arrive, so a big folder (or
     /// a slow drive) fills in before your eyes instead of showing nothing until the last file is
     /// read. The read belongs to this state, not to the view's task: that task restarts whenever
     /// the tree changes (twice a second during a scan), which must not start the read over.
+    /// The folder rows shown with the files are the latest ones given to `show`.
     @MainActor
-    func startReading(_ key: FilesKey, path: String, folder: Node, folderRows: [DetailItem],
+    func startReading(_ key: FilesKey, path: String, folder: Node,
                       uncounted: [FileKey: Int]?, whenListed: @escaping @MainActor () -> Void) {
         cancelReading()
-        folderRowsWhileReading = folderRows
+        // The files are read into an empty list (`DetailsView.reload` has emptied it already).
+        if !files.isEmpty || filesKey != nil { show(folders: folders, files: [], total: self.total) }
         let total = folder.allocated
         let task = Task { @MainActor [weak self] in
             let stop = ScanProgress()
-            let (arrivals, inbox) = AsyncStream<[DetailItem]>.makeStream()
-            inbox.onTermination = { _ in stop.cancel() }   // also when this task is cancelled
+            // The rows wait in `inbox`, and the main thread takes all there are each time it is told
+            // that more came. (Taking one batch of a few thousand per turn made a big folder crawl in
+            // while a scan kept the Mac busy: every turn on the main thread waits for a free core,
+            // and the turns, not the reading, set the pace.)
+            let inbox = DetailInbox()
+            let (news, notify) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+            notify.onTermination = { _ in stop.cancel() }   // also when this task is cancelled
             let reader = Task.detached(priority: .userInitiated) {
                 let complete = DetailLoader.streamFiles(in: path, folderTotal: total, uncounted: uncounted) { rows in
                     guard !stop.isCancelled else { return false }
-                    inbox.yield(rows)
+                    inbox.add(rows)
+                    notify.yield()
                     return true
                 }
-                inbox.finish()
+                notify.finish()
                 return complete
             }
             var shown = Date.distantPast
             var counted = Date.distantPast
-            var showTime: TimeInterval = 0
-            for await rows in arrivals {
+            for await _ in news {
                 // A stream hands over what it already holds even after its task is cancelled:
                 // a read that was replaced must not show its rows in place of the new folder's.
                 guard let self, !Task.isCancelled else { return }
                 // Appended in place: a second copy of the array (a local one, say) would make
                 // every batch copy all the rows read so far.
-                self.filesSoFar += rows
+                self.files += inbox.takeAll()
                 let now = Date()
-                if now.timeIntervalSince(shown) >= max(0.25, showTime * 4) {
-                    // Redraw a few times a second; less often when sorting all the rows takes a while.
-                    self.filesRead = self.filesSoFar.count
-                    self.show(self.folderRowsWhileReading + self.filesSoFar)
-                    showTime = Date().timeIntervalSince(now)
+                if now.timeIntervalSince(shown) >= 0.25 {
+                    // Redraw a few times a second, once the new rows are sorted in (on another
+                    // thread; rows arriving meanwhile wait for the next redraw).
+                    self.filesRead = self.files.count
+                    await self.sortNewFiles()
                     shown = Date()
                     counted = shown
                 } else if now.timeIntervalSince(counted) >= 0.1 {
                     // The count on the progress bar. Each change redraws the view, so not for every
                     // batch: with the Mac busy, redrawing for every batch made reading crawl.
-                    self.filesRead = self.filesSoFar.count
+                    self.filesRead = self.files.count
                     counted = now
                 }
             }
             let complete = await reader.value
             guard let self, !Task.isCancelled else { return }
+            self.files += inbox.takeAll()
+            await self.sortNewFiles()
+            // Only now is the folder read: a redraw before this must not start reading it again.
+            guard !Task.isCancelled else { return }
             self.reading = nil
-            let files = self.filesSoFar
-            self.filesSoFar = []
-            // The folder's size may have changed while its files were read (a scan filling in).
-            let listed = DetailLoader.withPercents(files, of: folder.allocated)
             // A read that failed partway (a drive unplugged, say) shows what it got, but isn't kept:
-            // coming back to the folder reads it again.
+            // coming back to the folder reads it again. ("% of Parent" follows the folder's total
+            // as it grows: see `DetailRows`.)
             if complete {
-                self.cachedFiles = (key, DetailLoader.Listing(items: listed, total: listed.count))
+                self.filesKey = key
+                self.cachedFiles = Listed(key: key, files: self.files, sorted: self.sortedFiles, sortOrder: self.sortOrder)
             }
-            self.show(self.folderRowsWhileReading + listed)
             self.finishLoading()
             self.listedFolder = path
             self.shownSignature = self.signatureToShow
@@ -553,7 +668,6 @@ final class DetailsState: ObservableObject {
         loading = false
         showProgress = false
     }
-    private var items: [DetailItem] = []
 
     /// Everything about a folder its rows show. When this is the same, so are the rows.
     struct Signature: Equatable {
@@ -585,10 +699,73 @@ final class DetailsState: ObservableObject {
         }
     }
 
-    /// Sorted once here rather than on every redraw: a folder can hold tens of thousands of files.
-    func show(_ newItems: [DetailItem]) {
-        items = newItems
-        rows = FastSort.sorted(newItems, using: sortOrder)
+    // MARK: Showing rows
+    // Sorted here rather than on every redraw, and only what changed: a folder can hold hundreds of
+    // thousands of files, while what changes during a scan is mostly its folder rows.
+
+    /// New folder rows (in the tree's order) with the files shown already: only the folders are sorted.
+    func show(folders: [DetailItem], total: Int64) {
+        self.folders = folders
+        self.total = total
+        sortedFolders = FastSort.sorted(folders, using: sortOrder)
+        rows = DetailRows(folders: sortedFolders, files: sortedFiles, total: total, order: RowOrder(sortOrder))
+    }
+
+    /// A folder's folder rows and files (in reading order; none while they are still to be read).
+    func show(folders: [DetailItem], files: [DetailItem], total: Int64) {
+        self.files = files
+        sortedFiles = FastSort.sorted(files, using: sortOrder)
+        filesKey = nil
+        show(folders: folders, total: total)
+    }
+
+    /// The folder rows with the files read last time: the files are sorted only if they aren't
+    /// already shown, or kept, in this order.
+    func show(folders: [DetailItem], listed: Listed, total: Int64) {
+        if filesKey != listed.key {
+            files = listed.files
+            if listed.sortOrder == sortOrder {
+                sortedFiles = listed.sorted
+            } else {
+                sortedFiles = FastSort.sorted(listed.files, using: sortOrder)
+                if cachedFiles?.key == listed.key {
+                    cachedFiles?.sorted = sortedFiles
+                    cachedFiles?.sortOrder = sortOrder
+                }
+            }
+            filesKey = listed.key
+        }
+        show(folders: folders, total: total)
+    }
+
+    /// While reading: the files read since the last redraw, sorted and merged in with the others
+    /// (rather than sorting them all again) on another thread, so the window stays free meanwhile:
+    /// sorting a few hundred thousand names takes seconds on a busy Mac. Dropped if the rows were
+    /// sorted again in the meantime (another order; that sorted these too) or the read was replaced.
+    @MainActor
+    private func sortNewFiles() async {
+        guard sortedFiles.count < files.count else { return }
+        let order = sortOrder
+        let sorted = sortedFiles
+        let new = Array(files[sorted.count...])
+        let merged = await Task.detached(priority: .userInitiated) {
+            FastSort.merged(sorted, FastSort.sorted(new, using: order), in: RowOrder(order))
+        }.value
+        guard !Task.isCancelled, order == sortOrder, sortedFiles.count == sorted.count else { return }
+        sortedFiles = merged
+        rows = DetailRows(folders: sortedFolders, files: sortedFiles, total: total, order: RowOrder(order))
+    }
+
+    /// Another sort order: everything is sorted again (the files from their reading order, so rows
+    /// that tie keep that order, as they would have if sorted this way from the start).
+    private func sortAgain() {
+        sortedFolders = FastSort.sorted(folders, using: sortOrder)
+        sortedFiles = FastSort.sorted(files, using: sortOrder)
+        if let key = filesKey, cachedFiles?.key == key {
+            cachedFiles?.sorted = sortedFiles
+            cachedFiles?.sortOrder = sortOrder
+        }
+        rows = DetailRows(folders: sortedFolders, files: sortedFiles, total: total, order: RowOrder(sortOrder))
     }
 }
 
@@ -667,8 +844,8 @@ enum DetailsColumn: String, CaseIterable {
 /// with the window frozen meanwhile.) Sorting, selection and scrolling go through bindings; the table
 /// is brought in step with them right after SwiftUI's update, never during it (see `scheduleSync`).
 struct DetailsTable: NSViewRepresentable {
-    let rows: [DetailItem]
-    /// Changes whenever `rows` does, so the table reloads only then.
+    let rows: DetailRows
+    /// Changes whenever `rows` does, so the table updates only then.
     let rowsVersion: Int
     let settings: DisplaySettings
     /// When the scan the Change column compares with was ("10 Nov"), for its tooltips.
@@ -750,12 +927,10 @@ struct DetailsTable: NSViewRepresentable {
         var parent: DetailsTable
         weak var table: DetailsTableView?
         /// The rows the table shows (a copy of `parent.rows` from the last sync).
-        private var rows: [DetailItem] = []
+        private var rows = DetailRows()
         private var shownVersion = -1
         private var shownSettings: DisplaySettings?
         private var shownSince = ""
-        /// Each row's position by path, made when a selection or scroll target has to be found.
-        private var positions: [String: Int]?
         private var syncScheduled = false
         /// Set while the table is changed from here, so its notifications don't echo back.
         private var applying = false
@@ -771,8 +946,7 @@ struct DetailsTable: NSViewRepresentable {
             table?.delegate = nil
             table?.onKey = nil
             table = nil
-            rows = []
-            positions = nil
+            rows = DetailRows()
         }
 
         // MARK: Keeping in step with SwiftUI
@@ -805,14 +979,16 @@ struct DetailsTable: NSViewRepresentable {
 
             if parent.rowsVersion != shownVersion || parent.settings != shownSettings || parent.since != shownSince {
                 let previousRow = table.selectedRow
-                if parent.rowsVersion != shownVersion {
-                    rows = parent.rows
-                    positions = nil
-                    shownVersion = parent.rowsVersion
-                }
+                let previousCount = rows.count
+                rows = parent.rows
+                shownVersion = parent.rowsVersion
                 shownSettings = parent.settings
                 shownSince = parent.since
-                table.reloadData()
+                // The views the table has get their rows' new contents. (`reloadData` would throw them
+                // all away and make new ones, the slowest part of a redraw: several times a second
+                // while a big folder is read.)
+                if rows.count != previousCount { table.noteNumberOfRowsChanged() }
+                showRowsAgain(in: table)
                 // The rows may have moved: keep the same item selected, not the same position.
                 select(parent.selection.first, in: table, near: previousRow)
             } else if let wanted = parent.selection.first, wanted != selectedID(in: table) {
@@ -822,8 +998,26 @@ struct DetailsTable: NSViewRepresentable {
             }
 
             if let target = parent.scrollTarget {
-                if let row = position(of: target) { scrollToMiddle(row, in: table) }
+                if let row = rows.row(of: target, near: table.selectedRow) { scrollToMiddle(row, in: table) }
                 parent.scrollTarget = nil
+            }
+        }
+
+        /// Shows the rows in the views the table has made for them (those on screen and a few
+        /// around), each cell changing only if what it shows does.
+        private func showRowsAgain(in table: NSTableView) {
+            var columns: [(index: Int, column: DetailsColumn)] = []
+            for (index, tableColumn) in table.tableColumns.enumerated() where !tableColumn.isHidden {
+                if let column = DetailsColumn(rawValue: tableColumn.identifier.rawValue) { columns.append((index, column)) }
+            }
+            table.enumerateAvailableRowViews { _, row in
+                guard rows.indices.contains(row) else { return }
+                let item = rows[row]
+                for (index, column) in columns {
+                    if let cell = table.view(atColumn: index, row: row, makeIfNecessary: false) {
+                        show(item, in: cell, as: column)
+                    }
+                }
             }
         }
 
@@ -837,22 +1031,12 @@ struct DetailsTable: NSViewRepresentable {
                 if table.selectedRow >= 0 { table.deselectAll(nil) }
                 return
             }
-            // Usually the item is still where it was; look it up only when it moved.
-            let row = rows.indices.contains(hint) && rows[hint].id == id ? hint : position(of: id)
-            if let row {
+            // Usually the item is still where it was, or near it.
+            if let row = rows.row(of: id, near: hint) {
                 if table.selectedRow != row { table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false) }
             } else if table.selectedRow >= 0 {
                 table.deselectAll(nil)
             }
-        }
-
-        private func position(of id: String) -> Int? {
-            if positions == nil {
-                var map = [String: Int](minimumCapacity: rows.count)
-                for (row, item) in rows.enumerated() { map[item.id] = row }
-                positions = map
-            }
-            return positions?[id]
         }
 
         /// Selects a row and scrolls it to the middle, with the Name column in view.
@@ -875,39 +1059,41 @@ struct DetailsTable: NSViewRepresentable {
         func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
             guard let tableColumn, let column = DetailsColumn(rawValue: tableColumn.identifier.rawValue),
                   rows.indices.contains(row) else { return nil }
-            let item = rows[row]
+            let cell: NSView
+            switch column {
+            case .name: cell = reuse(tableView, "name") { DetailsNameCell() }
+            case .percent: cell = reuse(tableView, "percent") { DetailsPercentCell() }
+            case .change: cell = reuse(tableView, "change") { DetailsChangeCell() }
+            case .allocated, .size, .files, .folders: cell = reuse(tableView, "number") { DetailsTextCell(alignment: .right) }
+            case .modified, .kind: cell = reuse(tableView, "text") { DetailsTextCell(alignment: .left) }
+            }
+            show(rows[row], in: cell, as: column)
+            return cell
+        }
+
+        /// Puts what a row shows in `column` into that column's cell.
+        private func show(_ item: DetailItem, in cell: NSView, as column: DetailsColumn) {
             let settings = parent.settings
             switch column {
             case .name:
-                let cell = reuse(tableView, "name") { DetailsNameCell() }
-                cell.show(item)
-                return cell
+                (cell as? DetailsNameCell)?.show(item)
             case .percent:
-                let cell = reuse(tableView, "percent") { DetailsPercentCell() }
-                cell.show(fraction: item.percent, settings: settings)
-                return cell
+                (cell as? DetailsPercentCell)?.show(fraction: item.percent, settings: settings)
             case .change:
-                let cell = reuse(tableView, "change") { DetailsChangeCell() }
-                cell.show(item.change, settings: settings, since: parent.since)
-                return cell
-            case .allocated, .size, .files, .folders:
-                let cell = reuse(tableView, "number") { DetailsTextCell(alignment: .right) }
-                switch column {
-                case .allocated: cell.show(settings.bytes(item.allocated))
-                case .size: cell.show(settings.bytes(item.size))
-                case .files: cell.show(item.isFolder ? SizeFormat.count(item.files) : "")
-                default: cell.show(item.isFolder ? SizeFormat.count(item.folders) : "")
-                }
-                return cell
+                (cell as? DetailsChangeCell)?.show(item.change, settings: settings, since: parent.since)
+            case .allocated:
+                (cell as? DetailsTextCell)?.show(settings.bytes(item.allocated))
+            case .size:
+                (cell as? DetailsTextCell)?.show(settings.bytes(item.size))
+            case .files:
+                (cell as? DetailsTextCell)?.show(item.isFolder ? SizeFormat.count(item.files) : "")
+            case .folders:
+                (cell as? DetailsTextCell)?.show(item.isFolder ? SizeFormat.count(item.folders) : "")
             case .modified:
-                let cell = reuse(tableView, "text") { DetailsTextCell(alignment: .left) }
-                cell.show(item.modified > Date(timeIntervalSince1970: 0)
-                          ? item.modified.formatted(.dateTime.year().month(.abbreviated).day()) : "")
-                return cell
+                (cell as? DetailsTextCell)?.show(item.modified > Date(timeIntervalSince1970: 0)
+                                                 ? item.modified.formatted(.dateTime.year().month(.abbreviated).day()) : "")
             case .kind:
-                let cell = reuse(tableView, "text") { DetailsTextCell(alignment: .left) }
-                cell.show(item.kind)
-                return cell
+                (cell as? DetailsTextCell)?.show(item.kind)
             }
         }
 
@@ -1046,9 +1232,13 @@ private final class DetailsMenuItem: NSMenuItem {
 
 private let detailsTextHeight: CGFloat = 17
 
+// The table shows new rows in the cells it has (see `DetailsTable.Coordinator.showRowsAgain`), so
+// each cell sets only what changed: setting a text, even the same one, redraws it.
+
 /// One line of text, left or right aligned (numbers use digits of equal width).
 final class DetailsTextCell: NSTableCellView {
     private let label = NSTextField(labelWithString: "")
+    private var text = ""
 
     init(alignment: NSTextAlignment) {
         super.init(frame: .zero)
@@ -1066,6 +1256,8 @@ final class DetailsTextCell: NSTableCellView {
     }
 
     func show(_ text: String) {
+        guard text != self.text else { return }
+        self.text = text
         label.stringValue = text
     }
 
@@ -1080,6 +1272,7 @@ final class DetailsTextCell: NSTableCellView {
 final class DetailsNameCell: NSTableCellView {
     private let icon = NSImageView()
     private let label = NSTextField(labelWithString: "")
+    private var shown: (name: String, image: NSImage, unreadable: Bool)?
 
     init() {
         super.init(frame: .zero)
@@ -1097,7 +1290,10 @@ final class DetailsNameCell: NSTableCellView {
     }
 
     func show(_ item: DetailItem) {
-        icon.image = IconCache.icon(for: item)
+        let image = IconCache.icon(for: item)
+        if let shown, shown.name == item.name, shown.image === image, shown.unreadable == item.unreadable { return }
+        shown = (item.name, image, item.unreadable)
+        icon.image = image
         label.stringValue = item.name
         label.textColor = item.unreadable ? .secondaryLabelColor : .labelColor
     }
@@ -1115,6 +1311,7 @@ final class DetailsNameCell: NSTableCellView {
 final class DetailsChangeCell: NSTableCellView {
     private let icon = NSImageView()
     private let label = NSTextField(labelWithString: "")
+    private var shown: (change: FolderChange?, settings: DisplaySettings, since: String)?
     @MainActor private static var symbols: [String: NSImage] = [:]
 
     init() {
@@ -1132,6 +1329,8 @@ final class DetailsChangeCell: NSTableCellView {
     }
 
     func show(_ change: FolderChange?, settings: DisplaySettings, since: String) {
+        if let shown, shown.change == change, shown.settings == settings, shown.since == since { return }
+        shown = (change, settings, since)
         guard let change else {
             icon.image = nil
             label.stringValue = ""
@@ -1186,12 +1385,15 @@ final class DetailsPercentCell: NSTableCellView {
     private let bar = GradientBar()
     private let label = NSTextField(labelWithString: "")
     private var fraction: CGFloat = 0
+    private var text = ""
+    private var colors: (start: String, end: String)?
 
     init() {
         super.init(frame: .zero)
         label.alignment = .right
         label.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         label.textColor = .secondaryLabelColor
+        bar.isHidden = true
         addSubview(track)
         addSubview(bar)
         addSubview(label)
@@ -1203,11 +1405,21 @@ final class DetailsPercentCell: NSTableCellView {
     }
 
     func show(fraction: Double, settings: DisplaySettings) {
-        self.fraction = CGFloat(min(1, max(0, fraction)))
-        bar.setColors(settings.barStart, settings.barEnd)
-        bar.isHidden = self.fraction <= 0
-        label.stringValue = SizeFormat.percent(fraction, decimals: 1)
-        needsLayout = true
+        if colors?.start != settings.barStartHex || colors?.end != settings.barEndHex {
+            colors = (settings.barStartHex, settings.barEndHex)
+            bar.setColors(settings.barStart, settings.barEnd)
+        }
+        let clamped = CGFloat(min(1, max(0, fraction)))
+        if clamped != self.fraction {
+            self.fraction = clamped
+            bar.isHidden = clamped <= 0
+            needsLayout = true
+        }
+        let text = SizeFormat.percent(fraction, decimals: 1)
+        if text != self.text {
+            self.text = text
+            label.stringValue = text
+        }
     }
 
     override func layout() {

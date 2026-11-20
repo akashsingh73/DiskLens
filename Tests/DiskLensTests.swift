@@ -249,6 +249,81 @@ struct DiskLensTests {
         c.equal(FastSort.sorted(rows, using: [KeyPathComparator(\.name)]).prefix(3).map(\.name),
                 ["File 0", "File 1", "File 2"], "names sort like Finder")
 
+        c.section("Keeping Details rows sorted as they change")
+        func folder(_ name: String, _ allocated: Int64, _ size: Int64, _ day: Double) -> DetailItem {
+            DetailItem(id: "/f/" + name, name: name, isFolder: true, size: size, allocated: allocated, files: 3,
+                       folders: 1, modified: Date(timeIntervalSince1970: day * 86_400), kind: "Folder",
+                       percent: Double(allocated) / 100, unreadable: false)
+        }
+        func apart(_ folders: [DetailItem], _ files: [DetailItem], _ order: [KeyPathComparator<DetailItem>]) -> DetailRows {
+            DetailRows(folders: FastSort.sorted(folders, using: order), files: FastSort.sorted(files, using: order),
+                       total: 100, order: RowOrder(order))
+        }
+        // Sizes and dates shared with the files, so folders and files tie (the folder comes first).
+        let folders = (0..<40).map { i in folder("Folder \((i * 13) % 40)", Int64(i % 7), Int64(i % 4), Double(i % 3)) }
+        for (index, order) in orders.enumerated() {
+            let together = FastSort.sorted(folders + rows, using: order).map(\.id)
+            c.equal(apart(folders, rows, order).map(\.id), together,
+                    "folders and files sorted apart show as sorted together, order \(index + 1)")
+            // Files arriving in batches, each merged into those before, as while a folder is read.
+            var merged: [DetailItem] = []
+            for start in stride(from: 0, to: rows.count, by: 37) {
+                let batch = FastSort.sorted(Array(rows[start..<min(start + 37, rows.count)]), using: order)
+                merged = FastSort.merged(merged, batch, in: RowOrder(order))
+            }
+            c.equal(merged.map(\.id), FastSort.sorted(rows, using: order).map(\.id),
+                    "files merged batch by batch end up sorted, order \(index + 1)")
+            let few = FastSort.sorted(Array(rows[..<5]), using: order)
+            let many = FastSort.sorted(Array(rows[5...]), using: order)
+            c.equal(FastSort.merged(few, many, in: RowOrder(order)).map(\.id), FastSort.sorted(rows, using: order).map(\.id),
+                    "many rows merged into a few, order \(index + 1)")
+        }
+        c.equal(FastSort.merged([], rows, in: RowOrder([KeyPathComparator(\.name)])).count, rows.count, "merging into nothing")
+        c.equal(FastSort.firstIndex(from: 0, to: 100) { $0 >= 63 }, 63, "galloping finds the first index past")
+        c.equal(FastSort.firstIndex(from: 10, to: 100) { $0 >= 5 }, 10, "already past at the start")
+        c.equal(FastSort.firstIndex(from: 0, to: 100) { _ in false }, 100, "never past")
+
+        // Files read while the folder was smaller have shares worked out from that smaller total.
+        let byShare = [KeyPathComparator(\DetailItem.percent, order: .reverse)]
+        let readEarlier = rows.map { row -> DetailItem in
+            var row = row
+            row.percent = Double(row.allocated) / 50
+            return row
+        }
+        let shares = DetailRows(folders: FastSort.sorted(folders, using: byShare),
+                                files: FastSort.sorted(readEarlier, using: byShare), total: 200, order: RowOrder(byShare))
+        c.equal(shares.map(\.id), FastSort.sorted(folders + rows, using: byShare).map(\.id),
+                "files read when the folder was smaller sort by their share of it now")
+        c.expect(shares.allSatisfy { $0.percent == Double($0.allocated) / 200 }, "% of Parent follows the folder's total")
+
+        let byName = apart(folders, rows, [KeyPathComparator(\.name)])
+        let shown = Array(byName)
+        for target in [shown[0], shown[57], shown[shown.count - 1], shown.first(where: \.isFolder)!] {
+            let row = shown.firstIndex { $0.id == target.id }!
+            c.equal(byName.row(of: target.id, near: row), row, "a row found where it is")
+            c.equal(byName.row(of: target.id, near: max(0, row - 5)), row, "a row found near where it was")
+            c.equal(byName.row(of: target.id, near: -1), row, "a row found with nothing to go on")
+        }
+        c.equal(byName.row(of: "/f/Missing", near: 3), nil, "a row not shown isn't found")
+        c.equal(DetailRows().row(of: "/f/File 1", near: 0), nil, "nothing is found in no rows")
+
+        c.section("Details rows as a folder changes")
+        let state = DetailsState()
+        state.show(folders: folders, files: rows, total: 100)
+        c.equal(state.rows.map(\.id), FastSort.sorted(folders + rows, using: state.sortOrder).map(\.id),
+                "a folder's rows, sorted")
+        let grown = (0..<40).map { (i: Int) -> DetailItem in
+            let size = Int64((i * 5) % 9)
+            return folder("Folder \((i * 13) % 40)", size, Int64(i % 4), Double(i % 3))
+        }
+        state.show(folders: grown, total: 100)
+        c.equal(state.rows.map(\.id), FastSort.sorted(grown + rows, using: state.sortOrder).map(\.id),
+                "new folder rows with the same files")
+        state.sortOrder = [KeyPathComparator(\.name)]
+        c.equal(state.rows.map(\.id), FastSort.sorted(grown + rows, using: state.sortOrder).map(\.id), "sorted again by name")
+        state.show(folders: [], files: [], total: 0)
+        c.expect(state.rows.isEmpty, "an empty folder shows no rows")
+
         c.section("Age bands")
         let day: Int64 = 86_400
         c.equal(AgeBands.index(ageSeconds: 0), 0, "brand new")

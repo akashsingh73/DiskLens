@@ -204,7 +204,12 @@ A few rules keep DiskLens stable; please keep to them:
   over two seconds at 50,000 rows); keep them that way. Details reads a folder's files in one pass
   (`getattrlistbulk`, like Finder) rather than looking each file up by name, which on exFAT drives searched the
   whole folder for every file (3.3 s against 0.02 s for 26,800 files); the rows appear as they are read, with
-  "Reading 12,000 of 63,855 files" whenever it takes more than a moment. "Expand All
+  "Reading 12,000 of 63,855 files" whenever it takes more than a moment. During a scan Details redraws twice a
+  second, so a redraw does only what changed: the table shows the new rows in the cells it already has
+  (`reloadData` makes every cell again), the folder rows and the files are sorted apart (`DetailRows`), so new
+  folder sizes never re-sort 300,000 files, new files are sorted in on another thread, and the main thread takes
+  all the rows read so far at once rather than a batch per turn (with the Mac busy, each turn waits for a
+  core). "Expand All
   Below" stops after a few thousand folders, and search keeps only the 500 largest matches and reads folders on
   background threads, stopping as soon as the text changes.
 
