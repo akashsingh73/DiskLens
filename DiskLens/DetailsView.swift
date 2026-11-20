@@ -353,6 +353,9 @@ struct DetailsView: View {
             state.finishLoading()
             state.listedFolder = path
             state.shownSignature = signature
+            // Kept in another order than the one chosen now, many files are sorted again on another
+            // thread: a file asked for is shown once its row is where it will stay.
+            if state.needsSorting { await state.sortFiles() }
             showPendingFile()
             return
         }
@@ -495,6 +498,7 @@ struct DetailRows: RandomAccessCollection {
 }
 
 /// View state for DetailsView, kept in a class so it builds without SwiftUI's macros.
+@MainActor
 final class DetailsState: ObservableObject {
     /// The rows in display order.
     @Published private(set) var rows = DetailRows() {
@@ -504,6 +508,7 @@ final class DetailsState: ObservableObject {
     private(set) var rowsVersion = 0
     @Published var folderLookup: [String: Node] = [:]
     @Published var selection = Set<DetailItem.ID>()
+    /// The order chosen. The rows follow it at once, or once sorted on another thread (see `sortAgain`).
     @Published var sortOrder = [KeyPathComparator(\DetailItem.allocated, order: .reverse)] {
         didSet { sortAgain() }
     }
@@ -543,21 +548,35 @@ final class DetailsState: ObservableObject {
     /// The folder's subfolders as the tree has them, and the same sorted.
     private var folders: [DetailItem] = []
     private var sortedFolders: [DetailItem] = []
-    /// The folder's files in reading order, and the same sorted. While they are being read, the ones
-    /// read since the last redraw are only in `files` (see `sortNewFiles`).
+    /// The folder's files in reading order, and the same sorted. Sorting can be behind (see
+    /// `sortFiles`): then only the first `sortedFiles.count` files are in `sortedFiles`.
     private var files: [DetailItem] = []
-    private var sortedFiles: [DetailItem] = []
+    private var sortedFiles: [DetailItem] = [] {
+        didSet { sortedVersion += 1 }
+    }
+    /// The order `sortedFolders` and `sortedFiles`, so the rows, are in. It differs from `sortOrder`
+    /// while many files are sorted in a newly chosen order on another thread.
+    private var shownOrder = [KeyPathComparator(\DetailItem.allocated, order: .reverse)]
+    /// These change when `files` is replaced and whenever `sortedFiles` does: sorting done meanwhile
+    /// on another thread is then dropped (see `sortFiles`).
+    private var filesGeneration = 0
+    private var sortedVersion = 0
+    /// The sorting under way on another thread, if any.
+    private var sorting: Task<Void, Never>?
     /// The listing `files` holds in full; nil while it is being read, or if reading it failed.
     private var filesKey: FilesKey?
     /// The folder's space on disk, for "% of Parent".
     private var total: Int64 = 0
+
+    /// Up to this many files are sorted at once when another order is chosen; more are sorted on
+    /// another thread, so the window stays free (by name, 300,000 files take a second or two).
+    static let sortHereLimit = 20_000
 
     /// The read in progress, which outlives the view's redraws (see `startReading`).
     private var reading: (key: FilesKey, task: Task<Void, Never>)?
 
     func isReading(_ key: FilesKey) -> Bool { reading?.key == key }
 
-    @MainActor
     func cancelReading() {
         reading?.task.cancel()
         reading = nil
@@ -568,7 +587,6 @@ final class DetailsState: ObservableObject {
     /// read. The read belongs to this state, not to the view's task: that task restarts whenever
     /// the tree changes (twice a second during a scan), which must not start the read over.
     /// The folder rows shown with the files are the latest ones given to `show`.
-    @MainActor
     func startReading(_ key: FilesKey, path: String, folder: Node,
                       uncounted: [FileKey: Int]?, whenListed: @escaping @MainActor () -> Void) {
         cancelReading()
@@ -608,7 +626,7 @@ final class DetailsState: ObservableObject {
                     // Redraw a few times a second, once the new rows are sorted in (on another
                     // thread; rows arriving meanwhile wait for the next redraw).
                     self.filesRead = self.files.count
-                    await self.sortNewFiles()
+                    await self.sortFiles()
                     shown = Date()
                     counted = shown
                 } else if now.timeIntervalSince(counted) >= 0.1 {
@@ -621,7 +639,7 @@ final class DetailsState: ObservableObject {
             let complete = await reader.value
             guard let self, !Task.isCancelled else { return }
             self.files += inbox.takeAll()
-            await self.sortNewFiles()
+            while !Task.isCancelled, self.sortedFiles.count < self.files.count { await self.sortFiles() }
             // Only now is the folder read: a redraw before this must not start reading it again.
             guard !Task.isCancelled else { return }
             self.reading = nil
@@ -630,7 +648,7 @@ final class DetailsState: ObservableObject {
             // as it grows: see `DetailRows`.)
             if complete {
                 self.filesKey = key
-                self.cachedFiles = Listed(key: key, files: self.files, sorted: self.sortedFiles, sortOrder: self.sortOrder)
+                self.cachedFiles = Listed(key: key, files: self.files, sorted: self.sortedFiles, sortOrder: self.shownOrder)
             }
             self.finishLoading()
             self.listedFolder = path
@@ -647,7 +665,6 @@ final class DetailsState: ObservableObject {
     @Published private(set) var showProgress = false
     private var progressDelay: Task<Void, Never>?
 
-    @MainActor
     func startLoading(expecting files: Int) {
         loading = true
         filesRead = 0
@@ -661,7 +678,6 @@ final class DetailsState: ObservableObject {
         }
     }
 
-    @MainActor
     func finishLoading() {
         progressDelay?.cancel()
         progressDelay = nil
@@ -707,65 +723,110 @@ final class DetailsState: ObservableObject {
     func show(folders: [DetailItem], total: Int64) {
         self.folders = folders
         self.total = total
-        sortedFolders = FastSort.sorted(folders, using: sortOrder)
-        rows = DetailRows(folders: sortedFolders, files: sortedFiles, total: total, order: RowOrder(sortOrder))
+        sortedFolders = FastSort.sorted(folders, using: shownOrder)
+        showSorted()
     }
 
     /// A folder's folder rows and files (in reading order; none while they are still to be read).
     func show(folders: [DetailItem], files: [DetailItem], total: Int64) {
         self.files = files
-        sortedFiles = FastSort.sorted(files, using: sortOrder)
+        filesGeneration += 1
         filesKey = nil
+        shownOrder = sortOrder
+        sortedFiles = FastSort.sorted(files, using: sortOrder)
         show(folders: folders, total: total)
     }
 
-    /// The folder rows with the files read last time: the files are sorted only if they aren't
-    /// already shown, or kept, in this order.
+    /// The folder rows with the files read last time, in the order they were kept in: sorted again
+    /// (see `sortAgain`) if that isn't the order chosen now.
     func show(folders: [DetailItem], listed: Listed, total: Int64) {
         if filesKey != listed.key {
             files = listed.files
-            if listed.sortOrder == sortOrder {
-                sortedFiles = listed.sorted
-            } else {
-                sortedFiles = FastSort.sorted(listed.files, using: sortOrder)
-                if cachedFiles?.key == listed.key {
-                    cachedFiles?.sorted = sortedFiles
-                    cachedFiles?.sortOrder = sortOrder
-                }
-            }
+            filesGeneration += 1
             filesKey = listed.key
+            shownOrder = listed.sortOrder
+            sortedFiles = listed.sorted
         }
         show(folders: folders, total: total)
+        sortAgain()
     }
 
-    /// While reading: the files read since the last redraw, sorted and merged in with the others
-    /// (rather than sorting them all again) on another thread, so the window stays free meanwhile:
-    /// sorting a few hundred thousand names takes seconds on a busy Mac. Dropped if the rows were
-    /// sorted again in the meantime (another order; that sorted these too) or the read was replaced.
-    @MainActor
-    private func sortNewFiles() async {
-        guard sortedFiles.count < files.count else { return }
-        let order = sortOrder
-        let sorted = sortedFiles
-        let new = Array(files[sorted.count...])
-        let merged = await Task.detached(priority: .userInitiated) {
-            FastSort.merged(sorted, FastSort.sorted(new, using: order), in: RowOrder(order))
-        }.value
-        guard !Task.isCancelled, order == sortOrder, sortedFiles.count == sorted.count else { return }
-        sortedFiles = merged
-        rows = DetailRows(folders: sortedFolders, files: sortedFiles, total: total, order: RowOrder(order))
+    private func showSorted() {
+        rows = DetailRows(folders: sortedFolders, files: sortedFiles, total: total, order: RowOrder(shownOrder))
     }
 
-    /// Another sort order: everything is sorted again (the files from their reading order, so rows
-    /// that tie keep that order, as they would have if sorted this way from the start).
-    private func sortAgain() {
-        sortedFolders = FastSort.sorted(folders, using: sortOrder)
-        sortedFiles = FastSort.sorted(files, using: sortOrder)
-        if let key = filesKey, cachedFiles?.key == key {
-            cachedFiles?.sorted = sortedFiles
-            cachedFiles?.sortOrder = sortOrder
+    /// The rows aren't yet all the files in the order chosen (see `sortFiles`).
+    var needsSorting: Bool { shownOrder != sortOrder || sortedFiles.count < files.count }
+
+    /// Shows the files sorted in `order` (all of them, or the first `sorted.count` while reading).
+    private func show(sorted: [DetailItem], in order: [KeyPathComparator<DetailItem>]) {
+        sortedFiles = sorted
+        if order != shownOrder {
+            shownOrder = order
+            sortedFolders = FastSort.sorted(folders, using: order)
         }
-        rows = DetailRows(folders: sortedFolders, files: sortedFiles, total: total, order: RowOrder(sortOrder))
+        // Kept sorted this way for coming back to the folder.
+        if let key = filesKey, cachedFiles?.key == key, sorted.count == files.count {
+            cachedFiles?.sorted = sorted
+            cachedFiles?.sortOrder = order
+        }
+        showSorted()
+    }
+
+    /// Another sort order: everything is sorted again, the files from their reading order, so rows
+    /// that tie keep that order, as they would have if sorted this way from the start. A few thousand
+    /// files are sorted at once; more on another thread, the rows keeping their order until then
+    /// (sorting 300,000 by name kept the window frozen for seconds).
+    private func sortAgain() {
+        guard shownOrder != sortOrder else { return }
+        if files.count <= Self.sortHereLimit {
+            show(sorted: FastSort.sorted(files, using: sortOrder), in: sortOrder)
+        } else if sorting == nil {
+            Task { [weak self] in await self?.sortFiles() }
+        }
+        // (Sorting under way picks up the new order when it is done with what it is doing.)
+    }
+
+    /// Sorts on another thread what isn't sorted yet: all the files again in a newly chosen order, or
+    /// else the files read since last time, merged in with the others (rather than sorting them all
+    /// again). Returns once everything is sorted, so `rows` shows every file in `sortOrder`. One
+    /// sorting at a time: one under way is waited for, and goes on until nothing is left to sort.
+    func sortFiles() async {
+        if sorting == nil {
+            sorting = Task { [weak self] in
+                await self?.sortUntilDone()
+                self?.sorting = nil
+            }
+        }
+        await sorting?.value
+    }
+
+    private func sortUntilDone() async {
+        while true {
+            let order = sortOrder
+            let generation = filesGeneration
+            let version = sortedVersion
+            if order != shownOrder {
+                let all = files
+                let sorted = await Task.detached(priority: .userInitiated) {
+                    FastSort.sorted(all, using: order)
+                }.value
+                // Another order chosen meanwhile, or other files shown: go again with what is there now.
+                guard generation == filesGeneration, order == sortOrder else { continue }
+                show(sorted: sorted, in: order)
+            } else if sortedFiles.count < files.count {
+                let base = sortedFiles
+                let new = Array(files[base.count...])
+                let merged = await Task.detached(priority: .userInitiated) {
+                    FastSort.merged(base, FastSort.sorted(new, using: order), in: RowOrder(order))
+                }.value
+                // Sorted otherwise meanwhile (another order, or other files): go again.
+                guard generation == filesGeneration, version == sortedVersion else { continue }
+                show(sorted: merged, in: order)
+            } else {
+                return
+            }
+        }
     }
 }
 

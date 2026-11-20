@@ -164,6 +164,17 @@ struct DiskLensTests {
 
     // MARK: - Small pieces
 
+    /// Runs the main run loop, so work handed to the main actor gets done, until `done` holds (for at
+    /// most `seconds`). Whether it held.
+    @MainActor
+    static func runMainLoop(upTo seconds: TimeInterval = 30, until done: () -> Bool) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: seconds)
+        while !done(), Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
+        }
+        return done()
+    }
+
     @MainActor
     static func unitTests(_ c: Checks) {
         c.section("Hard links in a part thrown away")
@@ -323,6 +334,29 @@ struct DiskLensTests {
         c.equal(state.rows.map(\.id), FastSort.sorted(grown + rows, using: state.sortOrder).map(\.id), "sorted again by name")
         state.show(folders: [], files: [], total: 0)
         c.expect(state.rows.isEmpty, "an empty folder shows no rows")
+
+        // Many files are sorted again on another thread: the rows keep their order until then.
+        let many = (0..<(DetailsState.sortHereLimit + 5_000)).map { (i: Int) -> DetailItem in
+            let name = "Many \((i * 7_919) % 25_000)"
+            return row(name, Int64(i % 13), Int64(i % 5), Double(i % 11))
+        }
+        let big = DetailsState()
+        big.show(folders: folders, files: many, total: 100)
+        let bySize = big.rows.map(\.id)
+        big.sortOrder = [KeyPathComparator(\.name)]
+        c.equal(big.rows.map(\.id), bySize, "many files keep their order while they are sorted again")
+        c.expect(big.needsSorting, "and are still to be sorted")
+        let manyByName = FastSort.sorted(folders + many, using: big.sortOrder).map(\.id)
+        c.expect(runMainLoop { big.rows.map(\.id) == manyByName }, "then show in the order chosen")
+        c.expect(!big.needsSorting, "with nothing left to sort")
+        big.sortOrder = [KeyPathComparator(\.modified)]
+        big.sortOrder = [KeyPathComparator(\.size, order: .reverse)]
+        let manyBySize = FastSort.sorted(folders + many, using: big.sortOrder).map(\.id)
+        c.expect(runMainLoop { !big.needsSorting && big.rows.map(\.id) == manyBySize },
+                 "orders chosen one after another end in the last one")
+        big.show(folders: grown, total: 100)
+        c.equal(big.rows.map(\.id), FastSort.sorted(grown + many, using: big.sortOrder).map(\.id),
+                "new folder rows go in the order the files are in")
 
         c.section("Age bands")
         let day: Int64 = 86_400

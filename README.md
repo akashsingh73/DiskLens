@@ -209,7 +209,8 @@ A few rules keep DiskLens stable; please keep to them:
   (`reloadData` makes every cell again), the folder rows and the files are sorted apart (`DetailRows`), so new
   folder sizes never re-sort 300,000 files, new files are sorted in on another thread, and the main thread takes
   all the rows read so far at once rather than a batch per turn (with the Mac busy, each turn waits for a
-  core). "Expand All
+  core). Choosing another sort order sorts a big folder on another thread too; the rows keep their order until
+  it is done. "Expand All
   Below" stops after a few thousand folders, and search keeps only the 500 largest matches and reads folders on
   background threads, stopping as soon as the text changes.
 
