@@ -491,21 +491,75 @@ enum FolderReader {
     /// Reads the files directly in `path` a batch at a time, in the order the folder lists them, and
     /// hands each batch to `batch` (on this thread), which returns false to stop. Returns false if the
     /// folder can't be read. Folders whose own drive can't read in one pass are read file by file.
+    ///
+    /// Hard links the scan left uncounted here come last, in a batch of their own: which of a file's
+    /// links the scan counted is known only once the whole folder is read (see `labelLinks`).
     @discardableResult
     static func files(in path: String, uncounted: [FileKey: Int]?, batch: ([FolderFile]) -> Bool) -> Bool {
         CloudFiles.withoutFetching {
-            var remaining = uncounted ?? [:]
-            // The scan's hard-link rule, applied in reading order (see `files(in:uncounted:)`).
-            func counted(_ facts: FileFacts) -> Bool {
-                guard facts.links > 1, let left = remaining[facts.key], left > 0 else { return true }
-                remaining[facts.key] = left - 1
-                return false
+            guard let uncounted, !uncounted.isEmpty else { return read(path, batch: batch) }
+            var held: [FolderFile] = []
+            var stopped = false
+            let readable = read(path) { files in
+                var ready: [FolderFile] = []
+                ready.reserveCapacity(files.count)
+                for file in files {
+                    if file.facts.links > 1, uncounted[file.facts.key] != nil {
+                        held.append(file)
+                    } else {
+                        ready.append(file)
+                    }
+                }
+                guard !ready.isEmpty else { return true }
+                stopped = !batch(ready)
+                return !stopped
             }
-            switch readInOnePass(path, counted: counted, batch: batch) {
-            case .read: return true
-            case .unreadable: return false
-            case .unsupported: return readFileByFile(path, counted: counted, batch: batch)
+            if !stopped, !held.isEmpty { _ = batch(labelLinks(held, uncounted: uncounted)) }
+            return readable
+        }
+    }
+
+    /// The scan's hard-link rule for one folder's files, given in the order the folder lists them:
+    /// the scan counts the first link to a file it comes to and none after it, so here a file's
+    /// first link counts, and the ones after it don't, unless every link to it here is one the scan
+    /// left uncounted (`uncounted`: the folder's `Node.uncountedLinks`), having counted it elsewhere.
+    static func labelLinks(_ files: [FolderFile], uncounted: [FileKey: Int]?) -> [FolderFile] {
+        guard let uncounted, !uncounted.isEmpty else { return files }
+        var here: [FileKey: Int] = [:]
+        for file in files where file.facts.links > 1 && uncounted[file.facts.key] != nil {
+            here[file.facts.key, default: 0] += 1
+        }
+        var seen: [FileKey: Int] = [:]
+        return files.map { file in
+            let key = file.facts.key
+            guard file.facts.links > 1, let links = here[key] else {
+                return FolderFile(name: file.name, facts: file.facts, counted: true)
             }
+            let order = seen[key, default: 0]
+            seen[key] = order + 1
+            let countedHere = max(0, links - (uncounted[key] ?? 0))    // 1, or 0 when counted elsewhere
+            return FolderFile(name: file.name, facts: file.facts, counted: order < countedHere)
+        }
+    }
+
+    /// The first link to the file `key` that `path` lists: the one counted from now on, once the link
+    /// the scan counted is moved to the Trash (see `labelLinks`). Nil if there is none, or the folder
+    /// can't be read.
+    static func firstLink(to key: FileKey, in path: String) -> String? {
+        var found: String?
+        files(in: path, uncounted: nil) { batch in
+            found = batch.first { $0.facts.key == key }?.name
+            return found == nil
+        }
+        return found
+    }
+
+    /// Every file, in one pass if the drive can, else file by file; all marked counted.
+    private static func read(_ path: String, batch: ([FolderFile]) -> Bool) -> Bool {
+        switch readInOnePass(path, batch: batch) {
+        case .read: return true
+        case .unreadable: return false
+        case .unsupported: return readFileByFile(path, batch: batch)
         }
     }
 
@@ -515,8 +569,7 @@ enum FolderReader {
     /// (`getattrlistbulk`, as Finder does). Asking for each file's details by name instead (`stat`)
     /// means a separate lookup per file, which on exFAT and FAT drives searches the whole folder each
     /// time: a 26,800-file folder on a USB drive took 3.3 s that way and 0.02 s this way.
-    private static func readInOnePass(_ path: String, counted: (FileFacts) -> Bool,
-                                      batch: ([FolderFile]) -> Bool) -> OnePass {
+    private static func readInOnePass(_ path: String, batch: ([FolderFile]) -> Bool) -> OnePass {
         let fd = open(path, O_RDONLY | O_DIRECTORY)
         guard fd >= 0 else { return .unreadable }
         defer { close(fd) }
@@ -593,7 +646,7 @@ enum FolderReader {
                     facts = FileFacts(st)
                     if facts.isDirectory { continue }
                 }
-                files.append(FolderFile(name: name, facts: facts, counted: counted(facts)))
+                files.append(FolderFile(name: name, facts: facts, counted: true))
             }
             if !files.isEmpty, !batch(files) { return .read }
         }
@@ -614,7 +667,7 @@ enum FolderReader {
     }
 
     /// Lists the folder and asks for each file's details by name: for drives that can't do `readInOnePass`.
-    static func readFileByFile(_ path: String, counted: (FileFacts) -> Bool, batch: ([FolderFile]) -> Bool) -> Bool {
+    static func readFileByFile(_ path: String, batch: ([FolderFile]) -> Bool) -> Bool {
         guard let dir = opendir(path) else { return false }
         defer { closedir(dir) }
         let fd = dirfd(dir)
@@ -629,7 +682,7 @@ enum FolderReader {
             guard fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { continue }
             let facts = FileFacts(st)
             if facts.isDirectory { continue }
-            files.append(FolderFile(name: name, facts: facts, counted: counted(facts)))
+            files.append(FolderFile(name: name, facts: facts, counted: true))
             if files.count == 1_000 {
                 guard batch(files) else { return true }
                 files.removeAll(keepingCapacity: true)
@@ -668,11 +721,41 @@ extension FileTally {
     /// Reads the folders again and totals their files the way the scan did, using the scan's
     /// clock (`now`) so every file lands in the same age band. Stops early when cancelled.
     static func read(_ folders: [TallyFolder], now: Int64, progress: ScanProgress) -> FileTally {
+        let files = CountedFiles.read(folders, now: now, progress: progress)
+        var total = files.tally
+        for file in files.linked { file.add(to: &total, now: now) }
+        return total
+    }
+}
+
+/// A file the scan counted that has other hard links: moving it to the Trash frees nothing while
+/// another link to it stays in the scan (see `ScanResult.removeFolder`).
+struct LinkedFile: Sendable {
+    let path: String
+    let key: FileKey
+    let size: Int64
+    let allocated: Int64
+    let modified: Int64
+
+    func add(to tally: inout FileTally, now: Int64) {
+        tally.add(ext: NameTools.fileExtension(of: (path as NSString).lastPathComponent),
+                  size: size, allocated: allocated, modified: modified, now: now)
+    }
+}
+
+/// The files of some folders as the scan counted them (see `FileTally.read`), with the ones that
+/// have other hard links kept apart.
+struct CountedFiles: Sendable {
+    /// File Types and Ages of the counted files, except `linked`.
+    var tally = FileTally()
+    var linked: [LinkedFile] = []
+
+    static func read(_ folders: [TallyFolder], now: Int64, progress: ScanProgress) -> CountedFiles {
         let readers = ScanEngine.readers
-        let slots = ResultSlots<FileTally>(count: readers)
+        let slots = ResultSlots<CountedFiles>(count: readers)
         // As many threads as a scan uses (see `ScanEngine.readers`), each taking every n-th folder.
         DispatchQueue.concurrentPerform(iterations: readers) { reader in
-            var tally = FileTally()
+            var counted = CountedFiles()
             for index in stride(from: reader, to: folders.count, by: readers) {
                 if progress.isCancelled { break }
                 let folder = folders[index]
@@ -680,16 +763,25 @@ extension FileTally {
                 // whose reading fails partway still counts the files read.
                 FolderReader.files(in: folder.path, uncounted: folder.uncounted) { batch in
                     for file in batch where file.counted {
-                        tally.add(ext: NameTools.fileExtension(of: file.name), size: file.facts.size,
-                                  allocated: file.facts.allocated, modified: file.facts.modified, now: now)
+                        if file.facts.links > 1 {
+                            counted.linked.append(LinkedFile(path: (folder.path as NSString).appendingPathComponent(file.name),
+                                                             key: file.facts.key, size: file.facts.size,
+                                                             allocated: file.facts.allocated, modified: file.facts.modified))
+                        } else {
+                            counted.tally.add(ext: NameTools.fileExtension(of: file.name), size: file.facts.size,
+                                              allocated: file.facts.allocated, modified: file.facts.modified, now: now)
+                        }
                     }
                     return !progress.isCancelled
                 }
             }
-            slots.set(reader, tally)
+            slots.set(reader, counted)
         }
-        var total = FileTally()
-        for tally in slots.all() { total.merge(tally) }
+        var total = CountedFiles()
+        for part in slots.all() {
+            total.tally.merge(part.tally)
+            total.linked += part.linked
+        }
         return total
     }
 }

@@ -280,6 +280,94 @@ final class ScanResult: @unchecked Sendable {
             ageCounts[i] = max(0, ageCounts[i] - tally.ageCounts[i])
         }
     }
+
+    // MARK: - Moving things to the Trash
+
+    /// Takes a file moved to the Trash out of `folder`. `uncountedLink` is set for a hard link the
+    /// scan didn't count: only the count of extra links changes. `link` is set for a file the scan
+    /// counted that has other hard links: if one of them is in the scan, nothing was freed, and that
+    /// link is counted from now on (see `countLink`). Returns the folder holding it, if so.
+    @discardableResult
+    func removeFile(_ path: String, in folder: Node, size: Int64, allocated: Int64, modified: Int64,
+                    uncountedLink: FileKey?, link: FileKey?) -> Node? {
+        topFiles.removeAll { $0.path == path }
+        if let key = uncountedLink {
+            folder.forgetUncountedLink(key)
+            hardLinkDuplicates = max(0, hardLinkDuplicates - 1)
+            return nil
+        }
+        if let key = link, let holder = folderHoldingLink(to: key, near: folder) {
+            if holder !== folder { folder.removeOwnFile(size: size, allocated: allocated) }
+            countLink(to: key, in: holder, size: size, allocated: allocated, modified: modified,
+                      replacing: holder === folder)
+            return holder
+        }
+        folder.removeOwnFile(size: size, allocated: allocated)
+        var tally = FileTally()
+        tally.add(ext: NameTools.fileExtension(of: (path as NSString).lastPathComponent),
+                  size: size, allocated: allocated, modified: modified, now: scanTime)
+        remove(tally)
+        return nil
+    }
+
+    /// Takes a folder moved to the Trash (at `path`) out of the scan: its totals, its extra hard links,
+    /// and the File Types and Ages of its files (`files`, counted before it went). A file of it whose
+    /// other link is still in the scan freed nothing: that link is counted from now on (see
+    /// `countLink`). Returns those files with the folders now holding them.
+    @discardableResult
+    func removeFolder(_ node: Node, path: String, files: CountedFiles) -> [(file: LinkedFile, folder: Node)] {
+        guard let parent = node.parent else { return [] }
+        parent.removeChild(node)              // from here on, walks through the tree don't see it
+        topFiles.removeAll { $0.path.hasPrefix(path + "/") }
+        hardLinkDuplicates = max(0, hardLinkDuplicates - node.uncountedLinksBelow)
+        var freed = files.tally
+        let holders = foldersHoldingLinks(to: Set(files.linked.map(\.key)))
+        var kept: [(file: LinkedFile, folder: Node)] = []
+        for file in files.linked {
+            if let holder = holders[file.key] {
+                countLink(to: file.key, in: holder, size: file.size, allocated: file.allocated, modified: file.modified)
+                kept.append((file, holder))
+            } else {
+                file.add(to: &freed, now: scanTime)
+            }
+        }
+        remove(freed)
+        return kept
+    }
+
+    /// A folder of the scan holding a hard link to the file `key` that the scan left uncounted,
+    /// looking in `near` first.
+    func folderHoldingLink(to key: FileKey, near: Node?) -> Node? {
+        if let near, (near.uncountedLinks?[key] ?? 0) > 0 { return near }
+        return foldersHoldingLinks(to: [key])[key]
+    }
+
+    /// The same for several files, in one walk through the tree.
+    func foldersHoldingLinks(to keys: Set<FileKey>) -> [FileKey: Node] {
+        var found: [FileKey: Node] = [:]
+        guard !keys.isEmpty else { return found }
+        var stack = [root]
+        while let node = stack.popLast() {
+            if let links = node.uncountedLinks {
+                for key in links.keys where found[key] == nil && keys.contains(key) { found[key] = node }
+                if found.count == keys.count { break }
+            }
+            stack.append(contentsOf: node.children)
+        }
+        return found
+    }
+
+    /// The link the scan counted for the file `key` went to the Trash, but `folder` holds another
+    /// link to it, which the scan left uncounted: the file still takes its space, through that link,
+    /// counted from now on. (`replacing`: the two links were in the same folder, whose totals stay.)
+    /// File Types and Ages keep the file as they had it; a new scan may file it under that link's
+    /// extension instead, if the two names have different ones.
+    func countLink(to key: FileKey, in folder: Node, size: Int64, allocated: Int64, modified: Int64,
+                   replacing: Bool = false) {
+        folder.forgetUncountedLink(key)
+        if !replacing { folder.addOwnFile(size: size, allocated: allocated, modified: modified) }
+        hardLinkDuplicates = max(0, hardLinkDuplicates - 1)
+    }
 }
 
 /// How a scan ended.

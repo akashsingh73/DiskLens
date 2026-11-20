@@ -262,6 +262,34 @@ final class Node: Identifiable, @unchecked Sendable {
         }
     }
 
+    /// Adds one file directly in this folder: a hard link counted from now on, because the link
+    /// the scan counted was moved to the Trash (see `ScanResult.countLink`).
+    func addOwnFile(size: Int64, allocated: Int64, modified: Int64) {
+        ownSize += size
+        ownAllocated += allocated
+        ownFileCount += 1
+        if modified > ownNewest { ownNewest = modified }
+        // Update the "[Files]" entry in place, as `removeOwnFile` does (none yet: it's made when asked for).
+        if let files = cachedFilesNode {
+            files.size = ownSize
+            files.allocated = ownAllocated
+            files.fileCount = ownFileCount
+            files.newest = ownNewest
+            files.ownSize = ownSize
+            files.ownAllocated = ownAllocated
+            files.ownFileCount = ownFileCount
+            files.ownNewest = ownNewest
+        }
+        var current: Node? = self
+        while let node = current {
+            node.size += size
+            node.allocated += allocated
+            node.fileCount += 1
+            if modified > node.newest { node.newest = modified }
+            current = node.parent
+        }
+    }
+
     /// Finds the folder node for an absolute path inside this scan (self must be the root).
     func descendant(atPath target: String) -> Node? {
         guard let rootPath else { return nil }

@@ -22,6 +22,7 @@ struct DiskLensTests {
         } catch {
             checks.fail("Couldn't build the test folder: \(error)")
         }
+        hardLinkTests(checks)
         for path in CommandLine.arguments.dropFirst() {
             compareWithDu(path: path, checks)
         }
@@ -29,6 +30,169 @@ struct DiskLensTests {
               ? "All \(checks.passed) checks passed."
               : "\(checks.failed) of \(checks.passed + checks.failed) checks FAILED.")
         exit(checks.failed == 0 ? 0 : 1)
+    }
+
+    // MARK: - Hard links in Details and the Trash
+
+    /// Which link of a hard-linked file Details counts, and what moving links (or folders holding
+    /// them) to the Trash does to the scan: after each move, its numbers must match a new scan.
+    @MainActor
+    static func hardLinkTests(_ c: Checks) {
+        c.section("Hard links in Details")
+        let fm = FileManager.default
+        let base = fm.temporaryDirectory.appendingPathComponent("DiskLensLinks-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: base) }
+        guard (try? fm.createDirectory(at: base, withIntermediateDirectories: true)) != nil,
+              let real = realpath(base.path, nil) else {
+            c.fail("couldn't make the test folder")
+            return
+        }
+        let root = String(cString: real)
+        free(real)
+        func write(_ relative: String, _ bytes: Int) {
+            let url = URL(fileURLWithPath: root + "/" + relative)
+            try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            fm.createFile(atPath: url.path, contents: Data(repeating: 0x62, count: bytes))
+        }
+        func hardLink(_ relative: String, to target: String) {
+            try? fm.createDirectory(atPath: ((root + "/" + relative) as NSString).deletingLastPathComponent,
+                                    withIntermediateDirectories: true)
+            if Darwin.link(root + "/" + target, root + "/" + relative) != 0 { c.fail("couldn't link \(relative)") }
+        }
+        write("same/a.bin", 300_000)                   // two links in one folder
+        hardLink("same/b.bin", to: "same/a.bin")
+        write("trio/x.dat", 200_000)                   // three links in one folder
+        hardLink("trio/y.dat", to: "trio/x.dat")
+        hardLink("trio/z.dat", to: "trio/x.dat")
+        write("one/split.bin", 150_000)                // one link in each of two folders
+        hardLink("two/split-link.bin", to: "one/split.bin")
+        write("one/plain.txt", 10_000)
+        write("keep/k.bin", 120_000)                   // for moving a folder to the Trash
+        hardLink("gone/k-link.bin", to: "keep/k.bin")
+        write("gone/other.txt", 5_000)
+
+        func scan() -> ScanResult? {
+            guard case .finished(let result) = ScanEngine.scan(path: root, displayName: "Links", topCount: 50,
+                                                               progress: ScanProgress()) else { return nil }
+            return result
+        }
+        guard let result = scan() else {
+            c.fail("the hard-link folder scan didn't finish")
+            return
+        }
+        let folder = { (name: String) in result.root.descendant(atPath: root + "/" + name) }
+        func files(_ name: String) -> [FolderFile] {
+            guard let node = folder(name) else { return [] }
+            return FolderReader.files(in: node.path, uncounted: node.uncountedLinks) ?? []
+        }
+
+        // Top Files lists every counted file here, under the name of the link the scan counted.
+        let countedByScan = Set(result.topFiles.map(\.path))
+        c.equal(countedByScan.count, 6, "the scan counts each of the six files once")
+        for name in ["same", "trio", "one", "two", "keep", "gone"] {
+            for file in files(name) {
+                let path = root + "/" + name + "/" + file.name
+                c.equal(file.counted, countedByScan.contains(path), "Details counts \(name)/\(file.name) as the scan did")
+            }
+        }
+
+        // The rule itself: the first link here counts, unless every link here is an uncounted one.
+        func facts(inode: UInt64) -> FileFacts {
+            FileFacts(size: 10, allocated: 4096, modified: 0, device: 1, inode: inode, links: 3, mode: UInt32(S_IFREG), flags: 0)
+        }
+        let three = ["p", "q", "r"].map { FolderFile(name: $0, facts: facts(inode: 7), counted: true) }
+        let key = FileKey(device: 1, inode: 7)
+        c.equal(FolderReader.labelLinks(three, uncounted: [key: 2]).map(\.counted), [true, false, false],
+                "of three links in a folder, the first counts")
+        c.equal(FolderReader.labelLinks(three, uncounted: [key: 3]).map(\.counted), [false, false, false],
+                "none count when the file was counted elsewhere")
+        c.equal(FolderReader.labelLinks(three, uncounted: nil).map(\.counted), [true, true, true],
+                "all count when the scan left none uncounted here")
+
+        c.section("Moving hard links to the Trash")
+        // The scan's numbers, after a move, against a new scan of what is left.
+        func matchesNewScan(_ what: String) {
+            guard let fresh = scan() else {
+                c.fail("couldn't scan again (\(what))")
+                return
+            }
+            c.equal(result.root.allocated, fresh.root.allocated, "\(what): space on disk")
+            c.equal(result.root.fileCount, fresh.root.fileCount, "\(what): files")
+            c.equal(result.hardLinkDuplicates, fresh.hardLinkDuplicates, "\(what): extra hard links")
+            c.equal(result.root.uncountedLinksBelow, fresh.root.uncountedLinksBelow, "\(what): extra links in the tree")
+            c.expect(result.extensions == fresh.extensions && result.ageAllocated == fresh.ageAllocated
+                     && result.ageCounts == fresh.ageCounts, "\(what): File Types and Ages")
+            var folders = [fresh.root]
+            while let node = folders.popLast() {
+                folders.append(contentsOf: node.children)
+                guard let mine = result.root.descendant(atPath: node.path) else {
+                    c.fail("\(what): \(node.name) missing")
+                    continue
+                }
+                c.expect(mine.ownAllocated == node.ownAllocated && mine.ownFileCount == node.ownFileCount
+                         && (mine.uncountedLinks ?? [:]) == (node.uncountedLinks ?? [:]),
+                         "\(what): \(node.name)'s own files")
+            }
+        }
+        // A file Details lists in `name`, counted or not.
+        func link(in name: String, counted: Bool) -> (node: Node, file: FolderFile)? {
+            guard let node = folder(name), let file = files(name).first(where: { $0.counted == counted }) else {
+                c.fail("no \(counted ? "counted" : "uncounted") link in \(name)")
+                return nil
+            }
+            return (node, file)
+        }
+        // What the app does after moving a file to the Trash (the file is deleted here instead).
+        func trash(_ name: String, counted: Bool) -> Node? {
+            guard let (node, file) = link(in: name, counted: counted) else { return nil }
+            let path = node.path + "/" + file.name
+            unlink(path)
+            return result.removeFile(path, in: node, size: file.facts.size, allocated: file.facts.allocated,
+                                     modified: file.facts.modified,
+                                     uncountedLink: counted ? nil : file.facts.key,
+                                     link: counted && file.facts.links > 1 ? file.facts.key : nil)
+        }
+
+        let sameKey = files("same").first?.facts.key
+        let sameHolder = trash("same", counted: true)
+        c.expect(sameHolder === folder("same"), "the counted link of two in one folder: the other one is counted now")
+        matchesNewScan("Counted link next to another")
+        if let sameKey, let same = folder("same") {
+            c.expect(FolderReader.firstLink(to: sameKey, in: same.path) != nil, "and Top Files can find it by name")
+        }
+
+        c.expect(trash("trio", counted: false) == nil, "an uncounted link of three in one folder")
+        matchesNewScan("Uncounted link")
+
+        let splitCounted = folder("one")?.uncountedLinks == nil ? "one" : "two"
+        let splitOther = splitCounted == "one" ? "two" : "one"
+        let splitHolder = trash(splitCounted, counted: true)
+        c.expect(splitHolder === folder(splitOther), "the counted link of a file linked from another folder: that folder counts it now")
+        matchesNewScan("Counted link, other link elsewhere")
+
+        // A folder holding the counted link, the other link outside it.
+        let keepCounted = folder("keep")?.uncountedLinks == nil ? "keep" : "gone"
+        if let node = folder(keepCounted) {
+            let path = node.path
+            let counted = CountedFiles.read(FileTally.folders(in: node, path: path), now: result.scanTime,
+                                            progress: ScanProgress())
+            c.equal(counted.linked.count, 1, "the folder's counted file with another link is kept apart")
+            try? fm.removeItem(atPath: path)
+            let kept = result.removeFolder(node, path: path, files: counted)
+            c.equal(kept.map(\.folder.name), [keepCounted == "keep" ? "gone" : "keep"],
+                    "a folder holding the counted link: the folder with the other link counts it now")
+            matchesNewScan("Folder with a counted link")
+        }
+        // A folder holding every link to its file: the space is freed.
+        if let node = folder("trio") {
+            let path = node.path
+            let counted = CountedFiles.read(FileTally.folders(in: node, path: path), now: result.scanTime,
+                                            progress: ScanProgress())
+            try? fm.removeItem(atPath: path)
+            c.equal(result.removeFolder(node, path: path, files: counted).count, 0,
+                    "a folder holding every link to a file frees its space")
+            matchesNewScan("Folder with all the links")
+        }
     }
 
     // MARK: - The tree arriving in pieces, and cloud folders
@@ -998,13 +1162,9 @@ struct DiskLensTests {
             folders.append(contentsOf: folder.children)
             guard !folder.unreadable, !folder.otherVolume,
                   let fast = FolderReader.files(in: folder.path, uncounted: folder.uncountedLinks) else { continue }
-            var remaining = folder.uncountedLinks ?? [:]
             var slow: [FolderFile] = []
-            FolderReader.readFileByFile(folder.path, counted: { facts in
-                guard facts.links > 1, let left = remaining[facts.key], left > 0 else { return true }
-                remaining[facts.key] = left - 1
-                return false
-            }, batch: { slow += $0; return true })
+            _ = FolderReader.readFileByFile(folder.path) { slow += $0; return true }
+            slow = FolderReader.labelLinks(slow, uncounted: folder.uncountedLinks)
             func describe(_ files: [FolderFile]) -> [String] {
                 files.map { f in
                     let x = f.facts

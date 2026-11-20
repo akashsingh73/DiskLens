@@ -636,7 +636,7 @@ final class AppModel: ObservableObject {
         let now = scan.scanTime
         let reading = ScanProgress()
         let counting = Task.detached(priority: .userInitiated) {
-            FileTally.read(folders, now: now, progress: reading)
+            CountedFiles.read(folders, now: now, progress: reading)
         }
         guard FileActions.confirmTrash(path: path, sizeText: SizeFormat.bytes(node.allocated)) else {
             reading.cancel()
@@ -644,7 +644,7 @@ final class AppModel: ObservableObject {
         }
         trashingName = node.name
         Task { @MainActor in
-            let tally = await counting.value
+            let files = await counting.value
             trashingName = nil
             guard FileActions.moveToTrash(path: path) else { return }
             Log.files.info("Moved folder to Trash: \(path, privacy: .public)")
@@ -658,10 +658,9 @@ final class AppModel: ObservableObject {
             if let previous = cameFrom, previous === node || previous.isInside(node) {
                 cameFrom = nil
             }
-            parent.removeChild(node)
-            scan.topFiles.removeAll { $0.path.hasPrefix(path + "/") }
-            scan.remove(tally)
-            scan.hardLinkDuplicates = max(0, scan.hardLinkDuplicates - node.uncountedLinksBelow)
+            let topFiles = Set(scan.topFiles.map(\.path))
+            let kept = scan.removeFolder(node, path: path, files: files)
+            showInTopFiles(kept.filter { topFiles.contains($0.file.path) }, of: scan)
             refreshChanges()
             refreshVolumes()
             version += 1
@@ -670,41 +669,67 @@ final class AppModel: ObservableObject {
 
     /// Moves one file to the Trash and takes it out of the scan. `uncountedLink` is set for a hard
     /// link whose space the scan counted through another link: the totals don't change for it.
+    /// Nor do they for a file the scan counted that has another link in the scan: that one is
+    /// counted from now on (see `ScanResult.removeFile`).
     func trashFile(path: String, size: Int64, allocated: Int64, modified: Int64, uncountedLink: FileKey? = nil) {
         guard !isReadingTree else { return explainWaitForScan() }
         guard trashingName == nil else {
             NSSound.beep()
             return
         }
-        guard FileActions.confirmTrash(path: path, sizeText: SizeFormat.bytes(allocated),
-                                       extraHardLink: uncountedLink != nil),
+        let scan = result
+        let folder = scan?.root.descendant(atPath: (path as NSString).deletingLastPathComponent)
+        var link: FileKey?
+        if uncountedLink == nil {
+            var st = stat()
+            if lstat(path, &st) == 0, st.st_nlink > 1 { link = FileFacts(st).key }
+        }
+        let freesNothing = uncountedLink != nil
+            || link.flatMap { scan?.folderHoldingLink(to: $0, near: folder) } != nil
+        guard FileActions.confirmTrash(path: path, sizeText: SizeFormat.bytes(allocated), extraHardLink: freesNothing),
               FileActions.moveToTrash(path: path) else { return }
         Log.files.info("Moved file to Trash: \(path, privacy: .public)")
-        let folderPath = (path as NSString).deletingLastPathComponent
-        if let scan = result, let folder = scan.root.descendant(atPath: folderPath) {
-            if let key = uncountedLink {
-                folder.forgetUncountedLink(key)
-                scan.hardLinkDuplicates = max(0, scan.hardLinkDuplicates - 1)
-            } else {
-                folder.removeOwnFile(size: size, allocated: allocated)
-                var tally = FileTally()
-                tally.add(ext: NameTools.fileExtension(of: (path as NSString).lastPathComponent),
-                          size: size, allocated: allocated, modified: modified, now: scan.scanTime)
-                scan.remove(tally)
-                if folder.ownFileCount == 0 {
-                    // The folder's "[Files]" entry is gone: don't leave anything pointing at it.
-                    if let current = selection, current.kind == .files, current.parent === folder {
-                        selection = folder
-                    }
-                    backStack.removeAll { $0.kind == .files && $0.parent === folder }
-                    forwardStack.removeAll { $0.kind == .files && $0.parent === folder }
+        if let scan, let folder {
+            let wasTopFile = scan.topFiles.contains { $0.path == path }
+            let holder = scan.removeFile(path, in: folder, size: size, allocated: allocated, modified: modified,
+                                         uncountedLink: uncountedLink, link: link)
+            if folder.ownFileCount == 0 {
+                // The folder's "[Files]" entry is gone: don't leave anything pointing at it.
+                if let current = selection, current.kind == .files, current.parent === folder {
+                    selection = folder
                 }
+                backStack.removeAll { $0.kind == .files && $0.parent === folder }
+                forwardStack.removeAll { $0.kind == .files && $0.parent === folder }
+            }
+            if wasTopFile, let holder, let link {
+                let file = LinkedFile(path: path, key: link, size: size, allocated: allocated, modified: modified)
+                showInTopFiles([(file, holder)], of: scan)
             }
         }
-        result?.topFiles.removeAll { $0.path == path }
         refreshChanges()
         refreshVolumes()
         version += 1
+    }
+
+    /// Largest files moved to the Trash whose space is still taken through another hard link, now
+    /// counted in `folder`: they stay in Top Files under that link's name, read from its folder in
+    /// the background.
+    private func showInTopFiles(_ kept: [(file: LinkedFile, folder: Node)], of scan: ScanResult) {
+        let wanted = kept.map { (file: $0.file, folder: $0.folder.path) }
+        guard !wanted.isEmpty else { return }
+        Task { @MainActor [weak self] in
+            let found = await Task.detached(priority: .userInitiated) {
+                wanted.compactMap { item -> TopFile? in
+                    guard let name = FolderReader.firstLink(to: item.file.key, in: item.folder) else { return nil }
+                    return TopFile(path: (item.folder as NSString).appendingPathComponent(name), size: item.file.size,
+                                   allocated: item.file.allocated, modified: item.file.modified)
+                }
+            }.value
+            guard let self, self.result === scan, !found.isEmpty else { return }
+            let shown = Set(scan.topFiles.map(\.path))
+            scan.topFiles = (scan.topFiles + found.filter { !shown.contains($0.path) }).sorted { $0.allocated > $1.allocated }
+            self.version += 1
+        }
     }
 
     // MARK: - Volume

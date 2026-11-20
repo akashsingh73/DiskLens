@@ -127,8 +127,10 @@ ad-hoc signature, so use `build.sh` for the copy you keep in Applications.
   size.
 - **On Disk** uses the blocks a file really occupies, so iCloud files that aren't downloaded, sparse files (such as
   Docker's disk image) and compressed files count honestly. It matches `du`.
-- Hard-linked files are counted once. In Details, the other links show 0 on disk and the kind
-  "Hard link (counted elsewhere)", so a folder's rows always add up to its total.
+- Hard-linked files are counted once, through the first link the scan comes to. In Details, the other links show
+  0 on disk and the kind "Hard link (counted elsewhere)", so a folder's rows always add up to its total.
+  Moving a link to the Trash frees no space while another link to the file stays in the scan, so the totals stay
+  the same and that other link is counted from then on.
 - On exFAT and FAT drives (the formats often used to share a drive with Windows), every folder also takes space of
   its own, up to 128 KB each on a big drive. That space is part of the folder's total, so totals still match `du`,
   but it isn't a row in Details.
