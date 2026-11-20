@@ -129,6 +129,15 @@ final class HardLinkRegistry: @unchecked Sendable {
         defer { lock.unlock() }
         return seen.insert(key).inserted
     }
+
+    /// Takes back first sightings from a part of a scan that was thrown away (stopped before it
+    /// was delivered), so the file is counted when that part is read again.
+    func forget(_ keys: [FileKey]) {
+        guard !keys.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        for key in keys { seen.remove(key) }
+    }
 }
 
 /// The parts of `stat` the scanner needs, the same on every platform.
@@ -234,6 +243,8 @@ struct ScanAccumulator {
     var cloudFolders: [CloudFolder] = []
     var hardLinkDuplicates = 0
     var statErrors = 0
+    /// Hard-linked files this part of the scan counted first (see `HardLinkRegistry.forget`).
+    var firstSightings: [FileKey] = []
 
     var pendingFiles = 0
     var pendingFolders = 0
@@ -250,10 +261,13 @@ struct ScanAccumulator {
                           links: HardLinkRegistry, path: () -> String) {
         // A file with several hard links is one set of blocks: count it the first time only,
         // and remember the others so Details and the Trash can tell them apart later.
-        if facts.links > 1 && !links.isFirstSighting(facts.key) {
-            hardLinkDuplicates += 1
-            folder.noteUncountedLink(facts.key)
-            return
+        if facts.links > 1 {
+            guard links.isFirstSighting(facts.key) else {
+                hardLinkDuplicates += 1
+                folder.noteUncountedLink(facts.key)
+                return
+            }
+            firstSightings.append(facts.key)
         }
         folder.ownSize += facts.size
         folder.ownAllocated += facts.allocated
@@ -327,6 +341,8 @@ final class WorkQueue: @unchecked Sendable {
     struct Job {
         let id: Int
         let folder: CloudFolder
+        /// Handed over from inside another folder being read (`add`), not one the queue began with.
+        var handedOff = false
     }
 
     private let condition = NSCondition()
@@ -384,7 +400,7 @@ final class WorkQueue: @unchecked Sendable {
         condition.lock()
         let id = nextID
         nextID += 1
-        jobs.append(Job(id: id, folder: folder))
+        jobs.append(Job(id: id, folder: folder, handedOff: true))
         condition.signal()
         condition.unlock()
         return id
@@ -395,6 +411,15 @@ final class WorkQueue: @unchecked Sendable {
         stopped = true
         condition.broadcast()
         condition.unlock()
+    }
+
+    /// The folders a stopped queue never handed out (call once every worker is done).
+    func leftOver() -> [Job] {
+        condition.lock()
+        defer { condition.unlock() }
+        let left = jobs
+        jobs = []
+        return left
     }
 }
 
@@ -519,7 +544,9 @@ enum FolderReader {
             let count = getattrlistbulk(fd, &request, buffer, capacity, UInt64(FSOPT_PACK_INVAL_ATTRS))
             if count < 0 {
                 // A drive that can't do this at all says so on the first call: read it file by file.
-                return first && (errno == ENOTSUP || errno == EINVAL || errno == ENOSYS) ? .unsupported : .read
+                // Any other error (a drive unplugged mid-read, say) means the folder wasn't read in
+                // full, which is reported rather than passed off as a shorter folder.
+                return first && (errno == ENOTSUP || errno == EINVAL || errno == ENOSYS) ? .unsupported : .unreadable
             }
             first = false
             if count == 0 { return .read }
@@ -592,7 +619,10 @@ enum FolderReader {
         defer { closedir(dir) }
         let fd = dirfd(dir)
         var files: [FolderFile] = []
-        while let entry = readdir(dir) {
+        while true {
+            // readdir returns nil both at the end and on an error; only an error sets errno.
+            errno = 0
+            guard let entry = readdir(dir) else { break }
             let name = NameTools.name(of: entry)
             if name == "." || name == ".." { continue }
             var st = stat()
@@ -605,8 +635,10 @@ enum FolderReader {
                 files.removeAll(keepingCapacity: true)
             }
         }
+        let readError = errno
         if !files.isEmpty { _ = batch(files) }
-        return true
+        errno = readError   // for whoever logs why
+        return readError == 0
     }
 }
 

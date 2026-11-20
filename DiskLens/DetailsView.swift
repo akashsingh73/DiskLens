@@ -68,30 +68,37 @@ enum DetailLoader {
     /// `uncounted` is the folder's `Node.uncountedLinks`.
     static func listFiles(in path: String, folderTotal: Int64, uncounted: [FileKey: Int]?) -> Listing {
         var items: [DetailItem] = []
-        streamFiles(in: path, folderTotal: folderTotal, uncounted: uncounted, every: .infinity) { rows in
+        streamFiles(in: path, folderTotal: folderTotal, uncounted: uncounted) { rows in
             items += rows
             return true
         }
         return Listing(items: items, total: items.count)
     }
 
-    /// Lists a folder's files like `listFiles`, handing the rows over while it reads: the first ones
-    /// as soon as there are any, then whatever arrived at most every `interval` seconds, and the rest
-    /// at the end. `deliver` runs on this thread and returns false to stop. False if the folder
-    /// can't be read.
+    /// The rows with "% of Parent" worked out again for a folder now holding `total` bytes.
+    static func withPercents(_ items: [DetailItem], of total: Int64) -> [DetailItem] {
+        items.map { item in
+            var copy = item
+            copy.percent = total > 0 ? Double(item.allocated) / Double(total) : 0
+            return copy
+        }
+    }
+
+    /// Lists a folder's files like `listFiles`, handing each batch of rows over as soon as it is read
+    /// (a few thousand at a time), so nothing already read waits behind a slow drive. `deliver` runs
+    /// on this thread and returns false to stop. False if the folder can't be read, or reading it
+    /// failed partway (the rows delivered so far are then only some of its files).
     @discardableResult
     static func streamFiles(in path: String, folderTotal: Int64, uncounted: [FileKey: Int]?,
-                            every interval: TimeInterval = 0.2, deliver: ([DetailItem]) -> Bool) -> Bool {
+                            deliver: ([DetailItem]) -> Bool) -> Bool {
         let folderPrefix = path.hasSuffix("/") ? path : path + "/"
-        var pending: [DetailItem] = []
-        var lastDelivery: Date?
-        var stopped = false
         let readable = FolderReader.files(in: path, uncounted: uncounted) { files in
-            pending.reserveCapacity(pending.count + files.count)
+            var rows: [DetailItem] = []
+            rows.reserveCapacity(files.count)
             for file in files {
                 let filePath = folderPrefix + file.name
                 let allocated = file.counted ? file.facts.allocated : 0
-                pending.append(DetailItem(
+                rows.append(DetailItem(
                     id: filePath, name: file.name, isFolder: false,
                     size: file.facts.size, allocated: allocated, files: 1, folders: 0,
                     modified: Date(timeIntervalSince1970: TimeInterval(file.facts.modified)),
@@ -100,13 +107,8 @@ enum DetailLoader {
                     unreadable: false,
                     uncountedLink: file.counted ? nil : file.facts.key))
             }
-            if let last = lastDelivery, Date().timeIntervalSince(last) < interval { return true }
-            lastDelivery = Date()
-            stopped = !deliver(pending)
-            pending.removeAll(keepingCapacity: true)
-            return !stopped
+            return deliver(rows)
         }
-        if !stopped, !pending.isEmpty { _ = deliver(pending) }
         if !readable {
             let reason = String(cString: strerror(errno))
             Log.files.error("Couldn't list \(path, privacy: .public): \(reason, privacy: .public)")
@@ -220,6 +222,7 @@ struct DetailsView: View {
                 await reload()
             }
             .onChange(of: model.fileToHighlight) { showPendingFile() }
+            .onDisappear { state.cancelReading() }
     }
 
     /// Double-click or Return: folders open inside DiskLens, files open in their app.
@@ -321,22 +324,29 @@ struct DetailsView: View {
                 state.selection = []
             }
         }
-        // The same folder redrawn (sizes changed while a scan fills in) and its own files
-        // unchanged: reuse the files read last time instead of reading them again.
-        if let cached = state.cachedFiles, cached.folder == folderID,
-           cached.ownFiles == directory.ownFileCount, cached.ownAllocated == directory.ownAllocated {
-            let files = cached.listing.items.map { item -> DetailItem in
-                var copy = item
-                copy.percent = total > 0 ? Double(item.allocated) / Double(total) : 0
-                return copy
-            }
-            state.show(folderRows + files)
+        // The folder's own files, as read last time or as being read now. A folder's own files
+        // rarely change while a scan fills in the rest of the tree, so this outlives the redraws.
+        let filesKey = DetailsState.FilesKey(folder: folderID, ownFiles: directory.ownFileCount,
+                                             ownAllocated: directory.ownAllocated,
+                                             uncountedLinks: uncounted?.values.reduce(0, +) ?? 0)
+        state.signatureToShow = signature
+        if let cached = state.cachedFiles, cached.key == filesKey {
+            state.show(folderRows + DetailLoader.withPercents(cached.listing.items, of: total))
             state.finishLoading()
             state.listedFolder = path
             state.shownSignature = signature
             showPendingFile()
             return
         }
+        if state.isReading(filesKey) {
+            // Still being read: show the new folder rows with the files so far, and let it finish.
+            // (Starting over on every redraw, twice a second during a scan, a big folder would
+            // never get listed.)
+            state.folderRowsWhileReading = folderRows
+            state.show(folderRows + state.filesSoFar)
+            return
+        }
+        state.cancelReading()
         state.show(folderRows)
         guard directory.ownFileCount > 0, !directory.unreadable else {
             state.finishLoading()
@@ -346,46 +356,13 @@ struct DetailsView: View {
             return
         }
         // The scan counted the folder's files, so how far reading has got can be shown.
-        state.startLoading(expecting: directory.ownFileCount + (uncounted?.values.reduce(0, +) ?? 0))
+        state.startLoading(expecting: filesKey.ownFiles + filesKey.uncountedLinks)
         // A short pause, so clicking quickly through folders doesn't read every one of them from disk.
         try? await Task.sleep(nanoseconds: 120_000_000)
         if Task.isCancelled { return }
 
-        // The files are read on another thread and shown as they arrive, so a big folder (or a slow
-        // drive) fills in before your eyes instead of showing nothing until the last file is read.
-        let stop = ScanProgress()
-        let (arrivals, inbox) = AsyncStream<[DetailItem]>.makeStream()
-        inbox.onTermination = { _ in stop.cancel() }   // also when this task is cancelled
-        Task.detached(priority: .userInitiated) {
-            DetailLoader.streamFiles(in: path, folderTotal: total, uncounted: uncounted) { rows in
-                guard !stop.isCancelled else { return false }
-                inbox.yield(rows)
-                return true
-            }
-            inbox.finish()
-        }
-        var files: [DetailItem] = []
-        var shown = Date.distantPast
-        var showTime: TimeInterval = 0
-        for await rows in arrivals {
-            files += rows
-            state.filesRead = files.count
-            // Redraw a few times a second; less often when sorting all the rows takes a while.
-            if Date().timeIntervalSince(shown) >= max(0.25, showTime * 4) {
-                let start = Date()
-                state.show(folderRows + files)
-                showTime = Date().timeIntervalSince(start)
-                shown = Date()
-            }
-        }
-        if Task.isCancelled { return }
-        let listing = DetailLoader.Listing(items: files, total: files.count)
-        state.cachedFiles = (folderID, directory.ownFileCount, directory.ownAllocated, listing)
-        state.show(folderRows + listing.items)
-        state.finishLoading()
-        state.listedFolder = path
-        state.shownSignature = signature
-        showPendingFile()
+        state.startReading(filesKey, path: path, folder: directory, folderRows: folderRows,
+                           uncounted: uncounted) { @MainActor in showPendingFile() }
     }
 }
 
@@ -449,8 +426,93 @@ final class DetailsState: ObservableObject {
     var shownFolder: ObjectIdentifier?
     /// What the rows were made from, to skip listing the folder again when nothing in it changed.
     var shownSignature: Signature?
+    /// The signature to record once the files being read are all listed (the latest redraw's).
+    var signatureToShow: Signature?
     /// The files of the folder read last, reused while its own files stay the same.
-    var cachedFiles: (folder: ObjectIdentifier, ownFiles: Int, ownAllocated: Int64, listing: DetailLoader.Listing)?
+    var cachedFiles: (key: FilesKey, listing: DetailLoader.Listing)?
+
+    /// A folder's own files as the scan knows them: while this stays the same, so does the list.
+    struct FilesKey: Equatable {
+        let folder: ObjectIdentifier
+        let ownFiles: Int
+        let ownAllocated: Int64
+        /// Hard links counted elsewhere: moving one to the Trash changes the list, not the totals.
+        let uncountedLinks: Int
+    }
+
+    /// The read in progress, which outlives the view's redraws (see `startReading`).
+    private var reading: (key: FilesKey, task: Task<Void, Never>)?
+    /// While reading: the folder rows to show with the files (updated on each redraw), and the files so far.
+    var folderRowsWhileReading: [DetailItem] = []
+    private(set) var filesSoFar: [DetailItem] = []
+
+    func isReading(_ key: FilesKey) -> Bool { reading?.key == key }
+
+    @MainActor
+    func cancelReading() {
+        reading?.task.cancel()
+        reading = nil
+        filesSoFar = []
+    }
+
+    /// Reads a folder's files on another thread and shows them as they arrive, so a big folder (or
+    /// a slow drive) fills in before your eyes instead of showing nothing until the last file is
+    /// read. The read belongs to this state, not to the view's task: that task restarts whenever
+    /// the tree changes (twice a second during a scan), which must not start the read over.
+    @MainActor
+    func startReading(_ key: FilesKey, path: String, folder: Node, folderRows: [DetailItem],
+                      uncounted: [FileKey: Int]?, whenListed: @escaping @MainActor () -> Void) {
+        cancelReading()
+        folderRowsWhileReading = folderRows
+        let total = folder.allocated
+        let task = Task { @MainActor [weak self] in
+            let stop = ScanProgress()
+            let (arrivals, inbox) = AsyncStream<[DetailItem]>.makeStream()
+            inbox.onTermination = { _ in stop.cancel() }   // also when this task is cancelled
+            let reader = Task.detached(priority: .userInitiated) {
+                let complete = DetailLoader.streamFiles(in: path, folderTotal: total, uncounted: uncounted) { rows in
+                    guard !stop.isCancelled else { return false }
+                    inbox.yield(rows)
+                    return true
+                }
+                inbox.finish()
+                return complete
+            }
+            var files: [DetailItem] = []
+            var shown = Date.distantPast
+            var showTime: TimeInterval = 0
+            for await rows in arrivals {
+                guard let self else { return }
+                files += rows
+                self.filesSoFar = files
+                self.filesRead = files.count
+                // Redraw a few times a second; less often when sorting all the rows takes a while.
+                if Date().timeIntervalSince(shown) >= max(0.25, showTime * 4) {
+                    let start = Date()
+                    self.show(self.folderRowsWhileReading + files)
+                    showTime = Date().timeIntervalSince(start)
+                    shown = Date()
+                }
+            }
+            let complete = await reader.value
+            guard let self, !Task.isCancelled else { return }
+            self.reading = nil
+            self.filesSoFar = []
+            // The folder's size may have changed while its files were read (a scan filling in).
+            let listed = DetailLoader.withPercents(files, of: folder.allocated)
+            // A read that failed partway (a drive unplugged, say) shows what it got, but isn't kept:
+            // coming back to the folder reads it again.
+            if complete {
+                self.cachedFiles = (key, DetailLoader.Listing(items: listed, total: listed.count))
+            }
+            self.show(self.folderRowsWhileReading + listed)
+            self.finishLoading()
+            self.listedFolder = path
+            self.shownSignature = self.signatureToShow
+            whenListed()
+        }
+        reading = (key, task)
+    }
     @Published private(set) var loading = false
     /// While reading a folder's files: how many have arrived, and how many the scan found.
     @Published var filesRead = 0

@@ -147,6 +147,18 @@ enum PathDisplay {
               original.st_dev == shortened.st_dev, original.st_ino == shortened.st_ino else { return path }
         return candidate
     }
+
+    /// The other way round: "/Users/me" becomes "/System/Volumes/Data/Users/me" when both name the
+    /// same folder, which is where a scan of the startup disk keeps it. Nil when they don't.
+    static func onDataVolume(_ path: String) -> String? {
+        guard path.hasPrefix("/"), path != "/", !path.hasPrefix(dataVolume + "/"), path != dataVolume else { return nil }
+        let candidate = dataVolume + path
+        var original = stat()
+        var onData = stat()
+        guard lstat(path, &original) == 0, lstat(candidate, &onData) == 0,
+              original.st_dev == onData.st_dev, original.st_ino == onData.st_ino else { return nil }
+        return candidate
+    }
 }
 
 // MARK: - Finder actions
@@ -154,7 +166,11 @@ enum PathDisplay {
 @MainActor
 enum FileActions {
     static func reveal(_ path: String) {
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: PathDisplay.friendly(path))])
+        reveal([path])
+    }
+
+    static func reveal(_ paths: [String]) {
+        NSWorkspace.shared.activateFileViewerSelecting(paths.map { URL(fileURLWithPath: PathDisplay.friendly($0)) })
     }
 
     static func open(_ path: String) {

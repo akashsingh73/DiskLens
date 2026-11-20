@@ -166,6 +166,22 @@ struct DiskLensTests {
 
     @MainActor
     static func unitTests(_ c: Checks) {
+        c.section("Hard links in a part thrown away")
+        let registry = HardLinkRegistry()
+        let linked = FileKey(device: 1, inode: 2)
+        c.expect(registry.isFirstSighting(linked) && !registry.isFirstSighting(linked), "a hard link counts once")
+        registry.forget([linked])
+        c.expect(registry.isFirstSighting(linked), "and counts again once the part that counted it is thrown away")
+
+        c.section("Folders handed over and never read")
+        let queue = WorkQueue([CloudFolder(path: "/a", name: "a", node: Node(name: "a", parent: nil))])
+        queue.add(CloudFolder(path: "/a/b", name: "b", node: Node(name: "b", parent: nil)))
+        queue.stop()
+        let left = queue.leftOver()
+        c.equal(left.map(\.folder.name), ["a", "b"], "a stopped queue gives back what it never handed out")
+        c.equal(left.map(\.handedOff), [false, true], "telling the folders it began with from those handed over")
+        c.equal(queue.leftOver().count, 0, "once")
+
         c.section("File extensions")
         let extensions: [(String, String)] = [
             ("photo.JPG", "jpg"), ("archive.tar.gz", "gz"), (".zshrc", ""), ("README", ""),
@@ -487,6 +503,17 @@ struct DiskLensTests {
         c.equal(twins.changes.first { $0.kind == .added }?.path, "s", "and the bigger one is new")
         c.equal(twins.change(at: "f")?.kind, .added, "empty folders are never taken for renamed ones")
 
+        let unreadNow = tree(["": 0, "evicted": 0, "unread": 0, "kept": 5])
+        unreadNow.children.first { $0.name == "evicted" }?.cloudOnly = true
+        unreadNow.children.first { $0.name == "unread" }?.pending = true
+        let unreadBase = FolderSnapshot(path: "/scan", date: earlier, allocated: 705,
+                                        children: ["": ["evicted": 400, "unread": 300, "kept": 5]])
+        let unread = FolderComparison(base: unreadBase, current: FolderSnapshot(root: unreadNow, path: "/scan",
+                                                                                date: later, opening: unreadBase))
+        c.equal(unread.removed, 0, "folders not read this time aren't taken for removed ones")
+        c.equal(unread.change(at: "evicted")?.change, -400, "one now only in the cloud shows the space it freed")
+        c.equal(unread.change(at: "unread")?.change, 0, "one not read (a scan stopped early) is taken as unchanged")
+
         c.section("Part of an earlier scan")
         if let part = base.part(at: "/scan/a") {
             c.equal(part.path, "/scan/a", "path of the part")
@@ -500,6 +527,17 @@ struct DiskLensTests {
         c.equal(base.part(at: "/scanner"), nil, "or for a folder outside it")
         c.equal(FolderSnapshot(path: "/", date: earlier, allocated: 5, children: ["": ["Users": 5], "Users": [:]])
                     .part(at: "/Users")?.allocated, 5, "a folder inside the root of a disk")
+        let startupDisk = FolderSnapshot(path: "/System/Volumes/Data", date: earlier, allocated: 5,
+                                         children: ["": ["Users": 5], "Users": [:]])
+        c.equal(startupDisk.part(at: "/System/Volumes/Data/Users", shownAs: "/Users")?.path, "/Users",
+                "a part of a startup disk scan takes the folder's usual path")
+        c.equal(PathDisplay.onDataVolume("/System/Volumes/Data/Users"), nil, "a path already on the data volume stays")
+        c.equal(PathDisplay.onDataVolume("/"), nil, "the root of the disk has no other name")
+        if FileManager.default.fileExists(atPath: "/System/Volumes/Data/Users") {
+            c.equal(PathDisplay.onDataVolume("/Users"), "/System/Volumes/Data/Users",
+                    "/Users is found where a startup disk scan keeps it")
+            c.equal(PathDisplay.onDataVolume("/System/Library"), nil, "a folder on the system volume isn't")
+        }
 
         c.section("Old scan history")
         let old = #"[{"date":816217450.1,"allocated":1324473909248,"path":"/Users/me","size":1981948116830,"files":6229192}]"#
@@ -856,7 +894,7 @@ struct DiskLensTests {
         }
         var batches = 0
         var rows = 0
-        DetailLoader.streamFiles(in: many, folderTotal: 1, uncounted: nil, every: 0) { delivered in
+        DetailLoader.streamFiles(in: many, folderTotal: 1, uncounted: nil) { delivered in
             batches += 1
             rows += delivered.count
             return true
@@ -864,7 +902,7 @@ struct DiskLensTests {
         c.equal(rows, 6_000, "all 6,000 files of a big folder are listed")
         c.expect(batches > 1, "they arrive in \(batches) batches, not all at the end")
         var firstOnly = 0
-        DetailLoader.streamFiles(in: many, folderTotal: 1, uncounted: nil, every: 0) { delivered in
+        DetailLoader.streamFiles(in: many, folderTotal: 1, uncounted: nil) { delivered in
             firstOnly += delivered.count
             return false
         }

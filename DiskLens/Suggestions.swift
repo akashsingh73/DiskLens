@@ -203,8 +203,10 @@ struct SuggestionsView: View {
     var body: some View {
         // Finding node_modules looks at every folder. While a scan fills in (the tree changes twice
         // a second) the list is made again every few updates, and once more when the scan is done.
+        // Otherwise (a scan stopped early is never complete) every change counts: a move to the Trash.
+        let filling = !result.isComplete && model.isReadingTree
         let key = SuggestionsState.Key(result: ObjectIdentifier(result),
-                                       version: result.isComplete ? model.version : model.version / 4,
+                                       version: filling ? model.version / 4 : model.version,
                                        complete: result.isComplete)
         let scanTotal = max(1, result.root.allocated)
         ScrollView {

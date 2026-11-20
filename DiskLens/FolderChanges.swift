@@ -100,7 +100,15 @@ struct FolderSnapshot: Codable, Equatable, Sendable {
             var sizes: [String: Int64] = [:]
             sizes.reserveCapacity(node.children.count)
             for child in node.children {
-                if child.cloudOnly || child.pending { continue }
+                if child.cloudOnly || child.pending {
+                    // Not read this time, but still there: not "removed". A folder now only in the
+                    // cloud takes (almost) no space here, which shows as shrinking; one not read
+                    // (a scan stopped early) is taken as unchanged.
+                    if let before = earlier.children[folder]?[child.name] {
+                        sizes[child.name] = child.cloudOnly ? child.allocated : before
+                    }
+                    continue
+                }
                 sizes[child.name] = child.allocated
                 let childPath = Self.join(folder, child.name)
                 if earlier.children[childPath] != nil { nodes[childPath] = child }
@@ -120,7 +128,8 @@ struct FolderSnapshot: Codable, Equatable, Sendable {
 
     /// The part of this snapshot that covers `folder` (an absolute path inside the scanned folder),
     /// as if `folder` itself had been scanned. Nil unless the snapshot opened that folder.
-    func part(at folder: String) -> FolderSnapshot? {
+    /// `shownAs` is the path the part takes, when `folder` is another name for it (see `PathDisplay`).
+    func part(at folder: String, shownAs: String? = nil) -> FolderSnapshot? {
         guard let relative = Self.relativePath(of: folder, inside: path), !relative.isEmpty,
               let size = allocated(at: relative), isOpened(relative) else { return nil }
         let prefix = relative + "/"
@@ -128,7 +137,7 @@ struct FolderSnapshot: Codable, Equatable, Sendable {
         for (key, sizes) in children where key == relative || key.hasPrefix(prefix) {
             part[key == relative ? "" : String(key.dropFirst(prefix.count))] = sizes
         }
-        return FolderSnapshot(path: folder, date: date, allocated: size, children: part, partOf: partOf ?? path)
+        return FolderSnapshot(path: shownAs ?? folder, date: date, allocated: size, children: part, partOf: partOf ?? path)
     }
 
     // MARK: Paths
@@ -349,9 +358,14 @@ struct SnapshotStore: Sendable {
                 .sorted { $0.date > $1.date }
             var bases = Array(earlier.prefix(perRoot))
             if bases.isEmpty {
+                // A scan of the startup disk keeps "/Users/me" as "/System/Volumes/Data/Users/me".
+                let onDataVolume = PathDisplay.onDataVolume(snapshot.path)
                 bases = Array(all
                     .filter { $0.date < snapshot.date }
-                    .compactMap { $0.part(at: snapshot.path) }
+                    .compactMap { earlier in
+                        earlier.part(at: snapshot.path)
+                            ?? onDataVolume.flatMap { earlier.part(at: $0, shownAs: snapshot.path) }
+                    }
                     .sorted { $0.date > $1.date }
                     .prefix(perRoot))
             }

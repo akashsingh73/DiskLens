@@ -231,6 +231,14 @@ final class SearchModel: ObservableObject {
         guard let app, let result = app.result else { return nil }
         let key = IndexKey(result: ObjectIdentifier(result), version: app.version)
         if key != indexKey || index == nil {
+            if index != nil {
+                // Results point at folders by their place in the index, and the tree has changed
+                // (something moved to the Trash shifts every folder after it): drop the old ones
+                // rather than let them open the wrong folder. The search runs again (`refresh`).
+                folderHits = LargestHits(capacity: 0, bySize: false)
+                topFileHits = LargestHits(capacity: 0, bySize: false)
+                clearResults()
+            }
             let built = SearchIndex.build(root: result.root, rootPath: result.rootPath,
                                           rootName: result.displayName, topFiles: result.topFiles)
             index = built.index

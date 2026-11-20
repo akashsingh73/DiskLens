@@ -220,7 +220,13 @@ struct TopFilesView: View {
             .width(min: 80, ideal: 110)
         }
         .contextMenu(forSelectionType: TopFile.ID.self) { ids in
-            if let path = ids.first, let file = result.topFiles.first(where: { $0.path == path }) {
+            // Right-clicking one of several selected rows hands over the whole selection, with no
+            // way to tell which row was clicked: offer only what makes sense for all of them.
+            if ids.count > 1 {
+                let paths = result.topFiles.map(\.path).filter { ids.contains($0) }
+                Button("Reveal \(SizeFormat.count(paths.count, "File")) in Finder") { FileActions.reveal(paths) }
+                Button("Copy Paths") { FileActions.copyText(paths.map(PathDisplay.friendly).joined(separator: "\n")) }
+            } else if let path = ids.first, let file = result.topFiles.first(where: { $0.path == path }) {
                 Button("Reveal in Finder") { FileActions.reveal(file.path) }
                 Button("Open") { FileActions.open(file.path) }
                 Button("Quick Look") { state.previewURL = URL(fileURLWithPath: file.path) }
@@ -235,7 +241,7 @@ struct TopFilesView: View {
                 }
             }
         } primaryAction: { ids in
-            if let path = ids.first { FileActions.reveal(path) }
+            FileActions.reveal(result.topFiles.map(\.path).filter { ids.contains($0) })
         }
         .quickLookPreview($state.previewURL)
     }

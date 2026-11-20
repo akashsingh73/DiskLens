@@ -158,6 +158,9 @@ final class AppModel: ObservableObject {
     /// Where the user was, to go back there when a rescan of the same folder finishes.
     private var placeToKeep: String?
     private var cloudProgress: ScanProgress?
+    /// The scan on screen finished while the last scan's cloud read was still stopping (it waits on
+    /// the internet): read this scan's cloud folders, and record its snapshot, once that one stops.
+    private var readCloudWhenStopped = false
     private var cloudPoll: Task<Void, Never>?
     private var cloudActivity: NSObjectProtocol?
     private var mouseMonitor: Any?
@@ -184,7 +187,13 @@ final class AppModel: ObservableObject {
     /// read in the background (unless Settings says to skip them).
     func scan(path requested: String) {
         guard !isScanning else { return }
+        // A folder being moved to the Trash is taken out of the tree once its files are counted.
+        guard trashingName == nil else {
+            NSSound.beep()
+            return
+        }
         stopReadingCloud()
+        readCloudWhenStopped = false
         let target = Self.resolve(requested)
         let progress = ScanProgress()
         let inbox = ScanInbox()
@@ -353,7 +362,11 @@ final class AppModel: ObservableObject {
         refreshVolumes()
 
         if Prefs.cloudFolderMode == .read && !scan.cloudFolders.isEmpty {
-            readCloudFolders()       // records the snapshot when it's done
+            if cloudProgress != nil {
+                readCloudWhenStopped = true      // see `cloudFinished`
+            } else if !readCloudFolders() {      // records the snapshot when it's done
+                recordSnapshot(of: scan)
+            }
         } else {
             recordSnapshot(of: scan)
         }
@@ -368,10 +381,12 @@ final class AppModel: ObservableObject {
 
     /// Reads the scan's folders that are only in the cloud, fetching them from the internet, in
     /// the background. They fill in on screen as they arrive; `stopReadingCloud` stops.
-    func readCloudFolders() {
-        guard let scan = result, scan.isComplete, !isScanning, cloudProgress == nil else { return }
+    /// False if there was nothing to read, or it can't start now.
+    @discardableResult
+    func readCloudFolders() -> Bool {
+        guard let scan = result, scan.isComplete, !isScanning, cloudProgress == nil, trashingName == nil else { return false }
         let folders = scan.cloudFolders.filter { $0.node.cloudOnly }
-        guard !folders.isEmpty else { return }
+        guard !folders.isEmpty else { return false }
         let progress = ScanProgress()
         let inbox = ScanInbox()
         cloudProgress = progress
@@ -405,6 +420,7 @@ final class AppModel: ObservableObject {
                 MainActor.assumeIsolated { self?.cloudFinished(progress: progress, inbox: inbox, scan: scan) }
             }
         }
+        return true
     }
 
     /// Stops reading cloud folders. What arrived so far stays; the rest stay marked as in the cloud.
@@ -425,7 +441,14 @@ final class AppModel: ObservableObject {
         isReadingCloud = false
         scan.cloudFolders = scan.cloudFolders.filter { $0.node.cloudOnly }
         Log.scan.info("Cloud folders read; \(scan.cloudFolders.count) left unread")
-        guard result === scan else { return }
+        guard result === scan else {
+            // A newer scan finished while this read was stopping: its turn now.
+            if readCloudWhenStopped, let current = result {
+                readCloudWhenStopped = false
+                if !readCloudFolders() { recordSnapshot(of: current) }
+            }
+            return
+        }
         version += 1
         HistoryStore.update(historyEntry(for: scan))
         history = HistoryStore.entries(for: scan.rootPath)

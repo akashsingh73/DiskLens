@@ -76,16 +76,30 @@ enum ScanEngine {
         // Reading from the disk, scans of the same disk (one per window) take turns at its readers.
         // Reading from the cloud waits on the internet instead, so it doesn't.
         let slots = fetchCloud ? nil : DiskReaders.slots(for: rootDevice)
+        // A folder handed over from inside a cloud folder and then not read (the read was stopped)
+        // goes back to being a folder in the cloud, so reading the cloud folders again finds it.
+        // Otherwise the folder around it, delivered, would leave it waiting to be read for good.
+        @Sendable func putBackInCloud(_ job: WorkQueue.Job) {
+            guard fetchCloud, job.handedOff else { return }
+            let contents = Node(name: job.folder.name, parent: nil)
+            contents.cloudOnly = true
+            var acc = ScanAccumulator(topCount: 0)
+            acc.cloudOnly = 1
+            acc.cloudFolders = [job.folder]
+            deliver(ScanPiece(placeholder: job.folder.node, contents: contents, stats: acc))
+        }
         DispatchQueue.concurrentPerform(iterations: workers) { _ in
             func work() {
                 while let job = queue.next() {
                     defer { queue.finished() }
                     if progress.isCancelled {
                         queue.stop()
+                        putBackInCloud(job)
                         continue
                     }
                     if let slots, !take(slots, unlessStopped: progress) {
                         queue.stop()
+                        putBackInCloud(job)
                         continue
                     }
                     let folder = job.folder
@@ -100,12 +114,19 @@ enum ScanEngine {
                     }
                     acc.flush(to: progress, currentPath: nil)
                     progress.branchFinished(job.id)
-                    if progress.isCancelled { continue }
+                    if progress.isCancelled {
+                        // Thrown away: the hard-linked files it counted first must count when it's read again.
+                        links.forget(acc.firstSightings)
+                        putBackInCloud(job)
+                        continue
+                    }
+                    acc.firstSightings = []      // only needed until it's delivered
                     deliver(ScanPiece(placeholder: folder.node, contents: contents, stats: acc))
                 }
             }
             if fetchCloud { work() } else { CloudFiles.withoutFetching(work) }
         }
+        queue.leftOver().forEach(putBackInCloud)
     }
 
     /// Waits for a free reader of the disk; false if the scan is stopped first.
@@ -211,7 +232,10 @@ enum ScanEngine {
         let fd = dirfd(dir)
         var subfolders: [(path: String, node: Node)] = []
 
-        while let entry = readdir(dir) {
+        while true {
+            // readdir returns nil both at the end and on an error; only an error sets errno.
+            errno = 0
+            guard let entry = readdir(dir) else { break }
             let name = NameTools.name(of: entry)
             if name == "." || name == ".." { continue }
 
@@ -242,6 +266,14 @@ enum ScanEngine {
                 acc.addFile(to: folder, facts: facts, ext: NameTools.fileExtension(of: name),
                             now: now, links: links, path: { childPath })
             }
+        }
+        let readError = errno
+        if readError != 0 {
+            // Reading stopped partway (a drive failing or unplugged, say): what was read stays,
+            // and the folder is listed among those that couldn't be read in full.
+            Log.scan.error("Couldn't finish reading \(path, privacy: .public): \(String(cString: strerror(readError)), privacy: .public)")
+            folder.unreadable = true
+            acc.noteUnreadable(path)
         }
         return subfolders
     }
