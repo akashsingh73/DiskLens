@@ -332,6 +332,8 @@ struct DiskLensTests {
                 "new folder rows with the same files")
         state.sortOrder = [KeyPathComparator(\.name)]
         c.equal(state.rows.map(\.id), FastSort.sorted(grown + rows, using: state.sortOrder).map(\.id), "sorted again by name")
+        _ = runMainLoop(upTo: 0.4) { false }
+        c.expect(state.sortingFiles == nil, "a quick sort shows no Sorting message")
         state.show(folders: [], files: [], total: 0)
         c.expect(state.rows.isEmpty, "an empty folder shows no rows")
 
@@ -346,9 +348,12 @@ struct DiskLensTests {
         big.sortOrder = [KeyPathComparator(\.name)]
         c.equal(big.rows.map(\.id), bySize, "many files keep their order while they are sorted again")
         c.expect(big.needsSorting, "and are still to be sorted")
+        c.expect(big.sortingFiles == nil, "with no Sorting message at once")
         let manyByName = FastSort.sorted(folders + many, using: big.sortOrder).map(\.id)
         c.expect(runMainLoop { big.rows.map(\.id) == manyByName }, "then show in the order chosen")
         c.expect(!big.needsSorting, "with nothing left to sort")
+        _ = runMainLoop(upTo: 0.4) { false }
+        c.expect(big.sortingFiles == nil, "and no Sorting message left")
         big.sortOrder = [KeyPathComparator(\.modified)]
         big.sortOrder = [KeyPathComparator(\.size, order: .reverse)]
         let manyBySize = FastSort.sorted(folders + many, using: big.sortOrder).map(\.id)

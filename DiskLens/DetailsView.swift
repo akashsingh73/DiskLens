@@ -218,14 +218,22 @@ struct DetailsView: View {
                      quickLook: { quickLook($0) }, trash: { trash($0) })
             .quickLookPreview($state.previewURL)
             .overlay(alignment: .bottom) {
+                // While a folder is still being read, how far that has got says more (sorting waits
+                // for it anyway).
                 if state.loading && state.showProgress {
                     ReadingProgress(read: state.filesRead, expected: state.filesExpected)
+                        .padding(.bottom, 14)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                } else if let count = state.sortingFiles {
+                    SortingProgress(files: count)
                         .padding(.bottom, 14)
                         .allowsHitTesting(false)
                         .transition(.opacity)
                 }
             }
             .animation(.easeOut(duration: 0.15), value: state.loading && state.showProgress)
+            .animation(.easeOut(duration: 0.15), value: state.sortingFiles != nil)
             .task(id: LoadKey(node: node.id, version: model.version, comparedWith: model.changes?.base.date)) {
                 await reload()
             }
@@ -510,7 +518,10 @@ final class DetailsState: ObservableObject {
     @Published var selection = Set<DetailItem.ID>()
     /// The order chosen. The rows follow it at once, or once sorted on another thread (see `sortAgain`).
     @Published var sortOrder = [KeyPathComparator(\DetailItem.allocated, order: .reverse)] {
-        didSet { sortAgain() }
+        didSet {
+            sortAgain()
+            noteSorting()
+        }
     }
     @Published var previewURL: URL?
     /// A row to scroll to (a file chosen in search).
@@ -556,7 +567,9 @@ final class DetailsState: ObservableObject {
     }
     /// The order `sortedFolders` and `sortedFiles`, so the rows, are in. It differs from `sortOrder`
     /// while many files are sorted in a newly chosen order on another thread.
-    private var shownOrder = [KeyPathComparator(\DetailItem.allocated, order: .reverse)]
+    private var shownOrder = [KeyPathComparator(\DetailItem.allocated, order: .reverse)] {
+        didSet { noteSorting() }
+    }
     /// These change when `files` is replaced and whenever `sortedFiles` does: sorting done meanwhile
     /// on another thread is then dropped (see `sortFiles`).
     private var filesGeneration = 0
@@ -683,6 +696,29 @@ final class DetailsState: ObservableObject {
         progressDelay = nil
         loading = false
         showProgress = false
+    }
+
+    /// While many files are sorted in a newly chosen order on another thread, once that has taken
+    /// more than a moment: how many, for "Sorting 300,000 files…" (nil otherwise: a quick sort
+    /// doesn't flash a message).
+    @Published private(set) var sortingFiles: Int?
+    private var sortingDelay: Task<Void, Never>?
+
+    /// Called whenever the order chosen or the order the rows are in changes.
+    private func noteSorting() {
+        if shownOrder != sortOrder {
+            guard sortingDelay == nil, sortingFiles == nil else { return }
+            sortingDelay = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                guard let self, !Task.isCancelled else { return }
+                self.sortingDelay = nil
+                if self.shownOrder != self.sortOrder { self.sortingFiles = self.files.count }
+            }
+        } else {
+            sortingDelay?.cancel()
+            sortingDelay = nil
+            if sortingFiles != nil { sortingFiles = nil }
+        }
     }
 
     /// Everything about a folder its rows show. When this is the same, so are the rows.
@@ -1518,11 +1554,34 @@ private struct ReadingProgress: View {
                 .monospacedDigit()
                 .lineLimit(1)
         }
-        .font(.callout)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background(.regularMaterial, in: Capsule())
-        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.1)))
-        .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+        .progressCapsule()
+    }
+}
+
+/// "Sorting 300,000 files…": shown while a big folder is sorted in a newly chosen order on another
+/// thread, once that takes more than a moment, since the rows keep their old order until it is done.
+private struct SortingProgress: View {
+    let files: Int
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ProgressView().controlSize(.small)
+            Text("Sorting \(SizeFormat.count(files, "file"))…")
+                .monospacedDigit()
+                .lineLimit(1)
+        }
+        .progressCapsule()
+    }
+}
+
+private extension View {
+    /// The floating capsule the Details progress messages sit in.
+    func progressCapsule() -> some View {
+        font(.callout)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(.regularMaterial, in: Capsule())
+            .overlay(Capsule().strokeBorder(Color.primary.opacity(0.1)))
+            .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
     }
 }
