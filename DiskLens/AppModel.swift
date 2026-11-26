@@ -10,6 +10,9 @@ final class ScanStatus: ObservableObject {
     /// Roughly how much space the scan will find, for a progress percentage: the last scan of
     /// the same folder, or the space in use when scanning a whole disk. nil when unknown.
     @Published var expected: Int64?
+    /// Nothing has been read for a few seconds: the disk is busy (another app copying, a backup)
+    /// or waking up, or a network drive isn't answering.
+    @Published var stalled = false
 
     /// How far the scan has got (0…0.99), or nil when there is nothing to measure it against.
     var fraction: Double? {
@@ -68,7 +71,8 @@ final class AppModel: ObservableObject {
     /// The folder shown before the current one. After going up, Details highlights the folder
     /// you came out of, the way Finder does.
     private(set) var cameFrom: Node?
-    @Published var fullDiskAccess = FullDiskAccess.isGranted
+    /// Checked off the main thread (see `checkFullDiskAccess`); assumed on until then, so no notice flashes.
+    @Published var fullDiskAccess = true
     @Published var showingError = false
     @Published private(set) var errorText = ""
     @Published private(set) var errorTitle = "Couldn't scan"
@@ -88,6 +92,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var volume: VolumeInfo?
     @Published private(set) var startupVolume: VolumeInfo?
     private var volumeTask: Task<Void, Never>?
+    private var volumeAgain = false
 
     /// While the tree is still changing (a scan, or cloud folders being read after it), things
     /// that rely on it staying put, like Move to Trash and search, wait.
@@ -101,6 +106,7 @@ final class AppModel: ObservableObject {
     init() {
         search.app = self
         refreshVolumes()
+        checkFullDiskAccess()
         // Another window finished a scan: keep the recent scans and History up to date here too.
         historyObserver = NotificationCenter.default.addObserver(forName: HistoryStore.didChange, object: nil,
                                                                  queue: .main) { [weak self] note in
@@ -110,6 +116,14 @@ final class AppModel: ObservableObject {
                 self.recentScans = HistoryStore.recent()
                 if let path = self.result?.rootPath { self.history = HistoryStore.entries(for: path) }
             }
+        }
+    }
+
+    /// Looks up whether DiskLens has Full Disk Access, without the main thread asking the disk.
+    func checkFullDiskAccess() {
+        Task { @MainActor [weak self] in
+            let granted = await DiskThreads.value { FullDiskAccess.isGranted }
+            if let self, self.fullDiskAccess != granted { self.fullDiskAccess = granted }
         }
     }
 
@@ -149,6 +163,7 @@ final class AppModel: ObservableObject {
     }
 
     private var activeProgress: ScanProgress?
+    private var activeInbox: ScanInbox?
     private var pollTask: Task<Void, Never>?
     private var scanActivity: NSObjectProtocol?
     /// The scan shown while it is still being read (its tree fills in as folders finish).
@@ -158,6 +173,8 @@ final class AppModel: ObservableObject {
     /// Where the user was, to go back there when a rescan of the same folder finishes.
     private var placeToKeep: String?
     private var cloudProgress: ScanProgress?
+    private var cloudInbox: ScanInbox?
+    private var cloudScan: ScanResult?
     /// The scan on screen finished while the last scan's cloud read was still stopping (it waits on
     /// the internet): read this scan's cloud folders, and record its snapshot, once that one stops.
     private var readCloudWhenStopped = false
@@ -194,45 +211,61 @@ final class AppModel: ObservableObject {
         }
         stopReadingCloud()
         readCloudWhenStopped = false
-        let target = Self.resolve(requested)
         let progress = ScanProgress()
         let inbox = ScanInbox()
         let started = Date()
-        let path = target.path
-        let name = target.displayName
         let topCount = Prefs.topFilesCountValue
 
         search.scanStarted()
         activeProgress = progress
+        activeInbox = inbox
         liveScan = nil
         isScanning = true
-        scanningName = name
+        // The folder's own name comes from the disk, with the rest (see below); until then, its last part.
+        scanningName = requested == "/" ? "/" : (requested as NSString).lastPathComponent
         status.snapshot = ScanProgress.Snapshot()
         status.elapsed = 0
-        status.expected = Self.expectedSize(of: path)
+        status.expected = nil
+        status.stalled = false
         showingError = false
-        fullDiskAccess = FullDiskAccess.isGranted
-        // Rescanning the same folder keeps your place once the scan gets there.
         placeToKeep = nil
-        if let old = result, old.rootPath == path, let current = selection {
-            placeToKeep = current.directory.path
-        }
         // Keeps macOS from slowing the scan down while DiskLens is in the background.
         scanActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Scanning a folder")
-        Log.scan.info("Scan started: \(path, privacy: .public)")
 
         pollTask?.cancel()
         pollTask = Task { @MainActor [weak self] in
+            var lastChange = Date()
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 250_000_000)
                 guard let self, self.activeProgress === progress else { return }
-                self.status.snapshot = progress.read()
+                let snapshot = progress.read()
+                let before = self.status.snapshot
+                if snapshot.files != before.files || snapshot.folders != before.folders
+                    || snapshot.branchesDone != before.branchesDone || snapshot.phase != before.phase {
+                    lastChange = Date()
+                }
+                let stalled = snapshot.phase != .finishing && Date().timeIntervalSince(lastChange) > Self.stallAfter
+                if self.status.stalled != stalled { self.status.stalled = stalled }
+                self.status.snapshot = snapshot
                 self.status.elapsed = Date().timeIntervalSince(started)
                 if let scan = self.liveScan { self.fillIn(from: inbox, into: scan, redrawEvery: 0.5) }
             }
         }
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        // Everything that asks the disk happens on the scan's thread, the folder's name and size
+        // included: on a disk that is busy or waking up, any of it can wait, and the window must not.
+        DiskThreads.start { [weak self] in
+            let target = Self.resolve(requested)
+            let path = target.path
+            let name = target.displayName
+            let expected = Self.expectedSize(of: path)
+            let access = FullDiskAccess.isGranted
+            Log.scan.info("Scan started: \(path, privacy: .public)")
+            DispatchQueue.main.async {
+                // Before the tree is shown: that is queued after this.
+                MainActor.assumeIsolated { self?.resolved(path: path, name: name, expected: expected, access: access,
+                                                          progress: progress) }
+            }
             let outcome = ScanEngine.stream(path: path, displayName: name, topCount: topCount, progress: progress,
                                             showTree: { tree in
                 DispatchQueue.main.async {
@@ -244,6 +277,21 @@ final class AppModel: ObservableObject {
             }
         }
     }
+
+    /// The scan's folder is found: what to show while it is read.
+    private func resolved(path: String, name: String, expected: Int64?, access: Bool, progress: ScanProgress) {
+        guard progress === activeProgress else { return }
+        scanningName = name
+        status.expected = expected
+        if fullDiskAccess != access { fullDiskAccess = access }
+        // Rescanning the same folder keeps your place once the scan gets there.
+        if let old = result, old.rootPath == path, let current = selection {
+            placeToKeep = current.directory.path
+        }
+    }
+
+    /// How long a scan goes without reading anything before it says it's waiting for the disk.
+    static let stallAfter: TimeInterval = 4
 
     /// The first two levels are read: show the tree, with the folders below still to come.
     private func show(_ tree: ScanResult, progress: ScanProgress) {
@@ -270,8 +318,13 @@ final class AppModel: ObservableObject {
         scan(path: path)
     }
 
+    /// Stops the scan. The window lets go of it at once, without waiting for its threads: on a disk
+    /// that is busy or waking up, they can be stuck in macOS for a long time before they notice.
+    /// What was read so far stays; anything they finish afterwards is dropped.
     func cancel() {
-        activeProgress?.cancel()
+        guard let progress = activeProgress else { return }
+        progress.cancel()
+        finish(.cancelled, progress: progress, inbox: activeInbox ?? ScanInbox())
     }
 
     func chooseFolder() {
@@ -292,6 +345,7 @@ final class AppModel: ObservableObject {
         pollTask?.cancel()
         pollTask = nil
         activeProgress = nil
+        activeInbox = nil
         if let activity = scanActivity {
             ProcessInfo.processInfo.endActivity(activity)
             scanActivity = nil
@@ -390,6 +444,8 @@ final class AppModel: ObservableObject {
         let progress = ScanProgress()
         let inbox = ScanInbox()
         cloudProgress = progress
+        cloudInbox = inbox
+        cloudScan = scan
         cloud.progress = CloudReadStatus.Progress(total: folders.count)
         isReadingCloud = true
         cloudActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiated,
@@ -413,7 +469,7 @@ final class AppModel: ObservableObject {
             }
         }
 
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        DiskThreads.start(qos: .utility) { [weak self] in
             ScanEngine.readCloudFolders(folders, rootDevice: rootDevice, links: links, topCount: topCount,
                                         now: now, progress: progress, deliver: { inbox.add($0) })
             DispatchQueue.main.async {
@@ -424,18 +480,34 @@ final class AppModel: ObservableObject {
     }
 
     /// Stops reading cloud folders. What arrived so far stays; the rest stay marked as in the cloud.
+    /// Doesn't wait for the threads reading: one waiting on the internet can take minutes to
+    /// notice, and Move to Trash and Find wait until the tree stops changing.
     func stopReadingCloud() {
-        cloudProgress?.cancel()
+        guard let progress = cloudProgress, let inbox = cloudInbox, let scan = cloudScan else { return }
+        progress.cancel()
+        cloudFinished(progress: progress, inbox: inbox, scan: scan)
     }
 
     private func cloudFinished(progress: ScanProgress, inbox: ScanInbox, scan: ScanResult) {
-        guard progress === cloudProgress else { return }
+        guard progress === cloudProgress else {
+            // A read let go of when it was stopped: what its threads finished since is dropped, so
+            // the hard links it counted first must count when those folders are read again.
+            scan.links.forget(inbox.takeAll().flatMap(\.stats.firstSightings))
+            return
+        }
+        cloudInbox = nil
+        cloudScan = nil
         cloudPoll?.cancel()
         cloudPoll = nil
         cloudProgress = nil
         if let activity = cloudActivity {
             ProcessInfo.processInfo.endActivity(activity)
             cloudActivity = nil
+        }
+        if progress.isCancelled {
+            _ = scan.fillIn(inbox.takeAll())
+            scan.putBackUnread()
+            needsRedraw = true
         }
         fillIn(from: inbox, into: scan, redrawEvery: 0)
         isReadingCloud = false
@@ -469,9 +541,9 @@ final class AppModel: ObservableObject {
         changes = nil
         snapshotTask?.cancel()
         snapshotTask = Task { @MainActor [weak self] in
-            let bases = await Task.detached(priority: .utility) {
+            let bases = await DiskThreads.value(qos: .utility) {
                 SnapshotStore.standard.record(snapshot)
-            }.value
+            }
             guard let self, self.result === scan else { return }
             self.comparisonBases = bases
             self.comparisonIndex = 0   // compares (didSet)
@@ -493,7 +565,7 @@ final class AppModel: ObservableObject {
 
     /// Roughly how much a scan of `path` will find: what the last scan of it found, or for a
     /// whole disk, the space in use on it.
-    static func expectedSize(of path: String) -> Int64? {
+    nonisolated static func expectedSize(of path: String) -> Int64? {
         if let last = HistoryStore.entries(for: path).last, last.allocated > 0 { return last.allocated }
         let components = (path as NSString).pathComponents
         let isDisk = path == "/" || path == "/System/Volumes/Data"
@@ -508,7 +580,7 @@ final class AppModel: ObservableObject {
     /// Symbolic links are followed, and a dropped file scans the folder it is in.
     /// Since macOS 10.15 the startup disk is two volumes and "/" shows the data volume through
     /// firmlinks; scanning the data volume counts every user byte exactly once.
-    static func resolve(_ requested: String) -> (path: String, displayName: String) {
+    nonisolated static func resolve(_ requested: String) -> (path: String, displayName: String) {
         var path = canonicalPath(requested)
         var isDirectory: ObjCBool = false
         if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue {
@@ -525,7 +597,7 @@ final class AppModel: ObservableObject {
         return (path, FileManager.default.displayName(atPath: path))
     }
 
-    private static func canonicalPath(_ path: String) -> String {
+    nonisolated private static func canonicalPath(_ path: String) -> String {
         guard let resolved = realpath(path, nil) else { return path }
         defer { free(resolved) }
         return String(cString: resolved)
@@ -635,8 +707,8 @@ final class AppModel: ObservableObject {
         let folders = FileTally.folders(in: node, path: path)
         let now = scan.scanTime
         let reading = ScanProgress()
-        let counting = Task.detached(priority: .userInitiated) {
-            CountedFiles.read(folders, now: now, progress: reading)
+        let counting = Task {
+            await DiskThreads.value { CountedFiles.read(folders, now: now, progress: reading) }
         }
         guard FileActions.confirmTrash(path: path, sizeText: SizeFormat.bytes(node.allocated)) else {
             reading.cancel()
@@ -644,9 +716,9 @@ final class AppModel: ObservableObject {
         }
         trashingName = node.name
         Task { @MainActor in
-            let files = await counting.value
+            let files = await Self.counted(counting, progress: reading, path: path)
             trashingName = nil
-            guard FileActions.moveToTrash(path: path) else { return }
+            guard await FileActions.moveToTrash(path: path) else { return }
             Log.files.info("Moved folder to Trash: \(path, privacy: .public)")
             // A rescan may have replaced the tree while the files were being counted.
             guard result === scan, let parent = node.parent, belongsToCurrentScan(node) else { return }
@@ -667,6 +739,37 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// How long counting a folder's files for the Trash may go without reading any, before it is
+    /// given up: the disk has stopped answering (a network drive gone, say).
+    static let countGivesUpAfter: TimeInterval = 20
+
+    /// The files `counting` counts, or none if the disk stops answering (see `countGivesUpAfter`).
+    /// The folder is still moved to the Trash then, and its space taken out of the scan; only File
+    /// Types and Ages keep its files, rather than the window waiting for good to move it.
+    private static func counted(_ counting: Task<CountedFiles, Never>, progress: ScanProgress,
+                                path: String) async -> CountedFiles {
+        let done = ScanProgress()      // its cancel flag says the count is done
+        Task {
+            _ = await counting.value
+            done.cancel()
+        }
+        var files = -1
+        var lastRead = Date()
+        while !done.isCancelled {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            let now = progress.read().files
+            if now != files {
+                files = now
+                lastRead = Date()
+            } else if Date().timeIntervalSince(lastRead) > countGivesUpAfter {
+                progress.cancel()
+                Log.files.error("Counting the files of \(path, privacy: .public) stopped: the disk isn't answering. File Types and Ages keep them.")
+                return CountedFiles()
+            }
+        }
+        return await counting.value
+    }
+
     /// Moves one file to the Trash and takes it out of the scan. `uncountedLink` is set for a hard
     /// link whose space the scan counted through another link: the totals don't change for it.
     /// Nor do they for a file the scan counted that has another link in the scan: that one is
@@ -679,16 +782,30 @@ final class AppModel: ObservableObject {
         }
         let scan = result
         let folder = scan?.root.descendant(atPath: (path as NSString).deletingLastPathComponent)
-        var link: FileKey?
-        if uncountedLink == nil {
-            var st = stat()
-            if lstat(path, &st) == 0, st.st_nlink > 1 { link = FileFacts(st).key }
+        Task { @MainActor in
+            // Asking the disk about the file, and moving it, happen off the main thread.
+            var link: FileKey?
+            if uncountedLink == nil {
+                link = await DiskThreads.value {
+                    var st = stat()
+                    return lstat(path, &st) == 0 && st.st_nlink > 1 ? FileFacts(st).key : nil
+                }
+            }
+            guard result === scan else { return }
+            let freesNothing = uncountedLink != nil
+                || link.flatMap { scan?.folderHoldingLink(to: $0, near: folder) } != nil
+            guard FileActions.confirmTrash(path: path, sizeText: SizeFormat.bytes(allocated), extraHardLink: freesNothing),
+                  await FileActions.moveToTrash(path: path) else { return }
+            Log.files.info("Moved file to Trash: \(path, privacy: .public)")
+            // A rescan may have replaced the tree meanwhile: it no longer has the file, or soon won't.
+            guard result === scan else { return }
+            trashedFile(path, scan: scan, folder: folder, size: size, allocated: allocated, modified: modified,
+                        uncountedLink: uncountedLink, link: link)
         }
-        let freesNothing = uncountedLink != nil
-            || link.flatMap { scan?.folderHoldingLink(to: $0, near: folder) } != nil
-        guard FileActions.confirmTrash(path: path, sizeText: SizeFormat.bytes(allocated), extraHardLink: freesNothing),
-              FileActions.moveToTrash(path: path) else { return }
-        Log.files.info("Moved file to Trash: \(path, privacy: .public)")
+    }
+
+    private func trashedFile(_ path: String, scan: ScanResult?, folder: Node?, size: Int64, allocated: Int64,
+                             modified: Int64, uncountedLink: FileKey?, link: FileKey?) {
         if let scan, let folder {
             let wasTopFile = scan.topFiles.contains { $0.path == path }
             let holder = scan.removeFile(path, in: folder, size: size, allocated: allocated, modified: modified,
@@ -718,13 +835,13 @@ final class AppModel: ObservableObject {
         let wanted = kept.map { (file: $0.file, folder: $0.folder.path) }
         guard !wanted.isEmpty else { return }
         Task { @MainActor [weak self] in
-            let found = await Task.detached(priority: .userInitiated) {
+            let found = await DiskThreads.value {
                 wanted.compactMap { item -> TopFile? in
                     guard let name = FolderReader.firstLink(to: item.file.key, in: item.folder) else { return nil }
                     return TopFile(path: (item.folder as NSString).appendingPathComponent(name), size: item.file.size,
                                    allocated: item.file.allocated, modified: item.file.modified)
                 }
-            }.value
+            }
             guard let self, self.result === scan, !found.isEmpty else { return }
             let shown = Set(scan.topFiles.map(\.path))
             scan.topFiles = (scan.topFiles + found.filter { !shown.contains($0.path) }).sorted { $0.allocated > $1.allocated }
@@ -740,16 +857,29 @@ final class AppModel: ObservableObject {
     }
 
     /// Looks up `volume` and `startupVolume` again, in the background.
+    /// One lookup at a time: with the disk busy, asking how much space is free can take seconds,
+    /// and asking again meanwhile only piled up waiting threads. A lookup asked for meanwhile runs
+    /// once this one is back.
     func refreshVolumes() {
+        guard volumeTask == nil else {
+            volumeAgain = true
+            return
+        }
         let path = result?.rootPath
-        volumeTask?.cancel()
         volumeTask = Task { @MainActor [weak self] in
-            let (scanned, startup) = await Task.detached(priority: .utility) {
+            let (scanned, startup) = await DiskThreads.value(qos: .utility) {
                 (path.flatMap { AppModel.volumeInfo(at: $0) }, AppModel.volumeInfo(at: "/"))
-            }.value
-            guard let self, !Task.isCancelled, self.result?.rootPath == path else { return }
-            if self.volume != scanned { self.volume = scanned }
-            if self.startupVolume != startup { self.startupVolume = startup }
+            }
+            guard let self else { return }
+            self.volumeTask = nil
+            if self.result?.rootPath == path {
+                if self.volume != scanned { self.volume = scanned }
+                if self.startupVolume != startup { self.startupVolume = startup }
+            }
+            if self.volumeAgain {
+                self.volumeAgain = false
+                self.refreshVolumes()
+            }
         }
     }
 

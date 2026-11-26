@@ -68,6 +68,10 @@ struct SettingsView: View {
                 Text("1 GB").tag(1_000.0)
                 Text("10 GB").tag(10_000.0)
             }
+            Toggle(isOn: prefs.$showHidden) {
+                Text("Show hidden files and folders (⇧⌘.)")
+                Text("Like .git or ~/Library, shown dimmed. Their space always counts, shown or not.")
+            }
             Toggle("Show a [Files] entry for each folder's loose files", isOn: prefs.$showFilesNode)
             Toggle("Sort by name instead of size", isOn: prefs.$sortByName)
         }

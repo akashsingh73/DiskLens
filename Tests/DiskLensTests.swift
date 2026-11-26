@@ -277,17 +277,228 @@ struct DiskLensTests {
         var rootStat = Darwin.stat()
         lstat(f.root, &rootStat)
         let busy = DiskReaders.slots(for: FileFacts(rootStat).device)
-        for _ in 0..<ScanEngine.readers { busy.wait() }
+        let holder = ScanProgress()
+        for _ in 0..<ScanEngine.readers { _ = busy.take(for: holder) }
+        c.equal(busy.free, 0, "another scan holds every reader")
         let stopping = ScanProgress()
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) { stopping.cancel() }
         let started = Date()
         let waitingOutcome = ScanEngine.scan(path: f.root, displayName: "Fixture", topCount: 10, progress: stopping)
         let waited = Date().timeIntervalSince(started)
-        for _ in 0..<ScanEngine.readers { busy.signal() }
         if case .cancelled = waitingOutcome {
             c.expect(waited < 2, "a scan waiting for the disk's readers stops when told to (took \(waited) s)")
         } else {
             c.fail("a scan stopped while waiting for the disk's readers should end as stopped")
+        }
+        // The scan holding them is stopped, but its threads are stuck waiting on the disk and never
+        // give them back: a new scan of the disk must still run, not wait for good.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { holder.cancel() }
+        let next = ScanProgress()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 10) { next.cancel() }
+        let nextStarted = Date()
+        if case .finished(let result) = ScanEngine.scan(path: f.root, displayName: "Fixture", topCount: 10, progress: next) {
+            c.equal(result.root.allocated, whole.root.allocated, "a scan after a stuck, stopped one reads everything")
+            c.expect(Date().timeIntervalSince(nextStarted) < 5, "…without waiting for the stuck one")
+        } else {
+            c.fail("a scan after a stopped scan that is stuck on the disk never ran")
+        }
+        c.equal(busy.free, ScanEngine.readers, "every reader is free again")
+        busy.giveBack(for: holder)       // the stuck threads come back: nothing to give back by then
+        c.equal(busy.free, ScanEngine.readers, "a stopped scan giving readers back late doesn't add any")
+
+        c.section("Scans under load")
+        // Swift's shared task threads all waiting on the disk (as when several windows wait on a
+        // busy drive): scans, which have threads of their own, still finish.
+        let stuck = DispatchSemaphore(value: 0)
+        let blockers = ProcessInfo.processInfo.activeProcessorCount * 2
+        for _ in 0..<blockers {
+            Task.detached { stuck.wait() }
+        }
+        let crowd = 8
+        let underLoad = ResultSlots<ScanResult>(count: crowd)
+        let crowdStarted = Date()
+        DiskThreads.run(crowd) { index in
+            if case .finished(let result) = ScanEngine.scan(path: f.root, displayName: "Fixture", topCount: 10,
+                                                            progress: ScanProgress()) {
+                underLoad.set(index, result)
+            }
+        }
+        let crowdResults = underLoad.all()
+        c.equal(crowdResults.count, crowd, "\(crowd) scans of one disk at once all finish with the task threads stuck")
+        c.expect(crowdResults.allSatisfy { $0.root.allocated == whole.root.allocated && $0.root.fileCount == whole.root.fileCount },
+                 "…each with the same totals as one alone")
+        c.expect(Date().timeIntervalSince(crowdStarted) < 20, "…in reasonable time")
+        let answered = ResultSlots<Bool>(count: 1)
+        DispatchQueue.global().async {
+            Task { @MainActor in answered.set(0, await DiskThreads.value { true }) }
+        }
+        c.expect(runMainLoop(upTo: 5) { answered.all() == [true] }, "work for the disk runs while the task threads are stuck")
+        for _ in 0..<blockers { stuck.signal() }
+
+        c.section("Waiting for another window's scan")
+        let holding = ScanProgress()
+        for _ in 0..<ScanEngine.readers { _ = busy.take(for: holding) }
+        let waitingScan = ScanProgress()
+        let waitingDone = DispatchSemaphore(value: 0)
+        DiskThreads.start {
+            _ = ScanEngine.scan(path: f.root, displayName: "Fixture", topCount: 10, progress: waitingScan)
+            waitingDone.signal()
+        }
+        var sawWaiting = false
+        for _ in 0..<50 where !sawWaiting {
+            Thread.sleep(forTimeInterval: 0.05)
+            sawWaiting = waitingScan.read().waitingForOtherScan
+        }
+        c.expect(sawWaiting, "a scan with every reader taken says it's waiting for another scan")
+        for _ in 0..<ScanEngine.readers { busy.giveBack(for: holding) }
+        c.expect(waitingDone.wait(timeout: .now() + 10) == .success, "…and goes on once they're free")
+        c.expect(!waitingScan.read().waitingForOtherScan, "…and no longer says so")
+
+        c.section("Stopping while the top folders are listed")
+        let stoppedEarly = ScanProgress()
+        stoppedEarly.cancel()
+        if case .cancelled = ScanEngine.scan(path: f.root, displayName: "Fixture", topCount: 10, progress: stoppedEarly) {
+            c.pass()
+        } else {
+            c.fail("a scan stopped before it starts should end as stopped")
+        }
+
+        c.section("Stopping a cloud read without waiting for it")
+        // A cloud folder that arrived, with a folder inside handed to another thread and never read
+        // (that thread is still waiting on the internet), and a piece for a folder inside that one.
+        let cloudRoot = Node(name: "Cloud", parent: nil)
+        cloudRoot.rootPath = "/cloud"
+        let arrived = Node(name: "Arrived", parent: cloudRoot)
+        cloudRoot.children = [arrived]
+        let handedOff = Node(name: "HandedOff", parent: arrived)
+        handedOff.pending = true
+        arrived.children = [handedOff]
+        cloudRoot.finalize()
+        let cloudScan = ScanResult(root: cloudRoot, rootPath: "/cloud", displayName: "Cloud", started: Date(),
+                                   rootDevice: 1, topCount: 10, links: HardLinkRegistry())
+        let inside = Node(name: "Inside", parent: nil)   // not in the tree: its folder never arrived
+        let lostKey = FileKey(device: 1, inode: 42)
+        _ = cloudScan.links.isFirstSighting(lostKey)
+        var lostStats = ScanAccumulator(topCount: 0)
+        lostStats.firstSightings = [lostKey]
+        cloudScan.fillIn([ScanPiece(placeholder: inside, contents: Node(name: "Inside", parent: nil), stats: lostStats)])
+        c.equal(cloudScan.piecesWaiting, 1, "a piece whose folder hasn't arrived waits")
+        cloudScan.putBackUnread()
+        c.expect(!handedOff.pending && handedOff.cloudOnly, "a folder handed off and never read is in the cloud again")
+        c.expect(cloudScan.cloudFolders.contains { $0.node === handedOff && $0.path == "/cloud/Arrived/HandedOff" },
+                 "…and is read the next time")
+        c.equal(cloudScan.piecesWaiting, 0, "pieces that can't arrive any more are dropped")
+        c.expect(cloudScan.links.isFirstSighting(lostKey), "…and the hard links they counted first count again")
+
+        c.section("Open file limit")
+        OpenFileLimit.raise()
+        var limits = rlimit()
+        getrlimit(RLIMIT_NOFILE, &limits)
+        c.expect(OpenFileLimit.current >= min(OpenFileLimit.wanted, limits.rlim_max),
+                 "DiskLens may open enough files for several windows' scans (\(OpenFileLimit.current))")
+
+        c.section("Two copies of DiskLens sharing files")
+        let shared = FileManager.default.temporaryDirectory.appendingPathComponent("DiskLensTests-history-\(getpid())")
+        try? FileManager.default.removeItem(at: shared)
+        HistoryStore.testFolder = shared
+        defer {
+            HistoryStore.testFolder = nil
+            try? FileManager.default.removeItem(at: shared)
+        }
+        let day = Date(timeIntervalSince1970: 1_700_000_000)
+        HistoryStore.append(HistoryEntry(path: "/a", date: day, size: 1, allocated: 1, files: 1))
+        c.equal(HistoryStore.entries(for: "/a").count, 1, "a scan is in the history at once")
+        HistoryStore.waitForWrites()
+        // Another copy of DiskLens adds a scan to the file meanwhile.
+        let file = shared.appendingPathComponent("history.json")
+        if var theirs = (try? Data(contentsOf: file)).flatMap({ try? JSONDecoder().decode([HistoryEntry].self, from: $0) }) {
+            theirs.append(HistoryEntry(path: "/b", date: day + 1, size: 2, allocated: 2, files: 2))
+            try? JSONEncoder().encode(theirs).write(to: file, options: .atomic)
+        } else {
+            c.fail("the history wasn't written to its file")
+        }
+        HistoryStore.append(HistoryEntry(path: "/a", date: day + 2, size: 3, allocated: 3, files: 3))
+        HistoryStore.waitForWrites()
+        let onDisk = (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode([HistoryEntry].self, from: $0) } ?? []
+        c.equal(onDisk.map(\.path), ["/a", "/b", "/a"], "neither copy's scans are lost")
+        c.equal(HistoryStore.recent().map(\.path), ["/a", "/b"], "…and this copy shows the other's too")
+        HistoryStore.update(HistoryEntry(path: "/b", date: day + 1, size: 9, allocated: 9, files: 9))
+        HistoryStore.waitForWrites()
+        c.equal(HistoryStore.entries(for: "/b").map(\.allocated), [9], "a scan the other copy added can be updated")
+        // Two copies writing at the same moment: the file lock keeps every change.
+        let counter = shared.appendingPathComponent("counter")
+        try? "0".write(to: counter, atomically: true, encoding: .utf8)
+        DiskThreads.run(4) { _ in
+            for _ in 0..<50 {
+                _ = try? FileLock.withLock(shared.appendingPathComponent("counter.lock")) {
+                    let value = Int((try? String(contentsOf: counter, encoding: .utf8)) ?? "") ?? 0
+                    try? String(value + 1).write(to: counter, atomically: true, encoding: .utf8)
+                }
+            }
+        }
+        c.equal((try? String(contentsOf: counter, encoding: .utf8)).flatMap { Int($0) }, 200,
+                "changes made under the file lock all land")
+
+        c.section("Hidden files")
+        let hiddenRoot = FileManager.default.temporaryDirectory.appendingPathComponent("DiskLensTests-hidden-\(getpid())").path
+        try? FileManager.default.removeItem(atPath: hiddenRoot)
+        defer { try? FileManager.default.removeItem(atPath: hiddenRoot) }
+        let blob = Data(repeating: 7, count: 64 * 1024)
+        for folder in ["shown", ".dotted", "flagged", "shown/deep/.inner"] {
+            try? FileManager.default.createDirectory(atPath: hiddenRoot + "/" + folder, withIntermediateDirectories: true)
+            FileManager.default.createFile(atPath: hiddenRoot + "/" + folder + "/file.bin", contents: blob)
+        }
+        FileManager.default.createFile(atPath: hiddenRoot + "/.dotfile", contents: blob)
+        FileManager.default.createFile(atPath: hiddenRoot + "/plain", contents: blob)
+        chflags(hiddenRoot + "/flagged", UInt32(UF_HIDDEN))
+        if case .finished(let scanned) = ScanEngine.scan(path: hiddenRoot, displayName: "Hidden", topCount: 10,
+                                                         progress: ScanProgress()) {
+            let byName = Dictionary(uniqueKeysWithValues: scanned.root.children.map { ($0.name, $0) })
+            c.expect(byName[".dotted"]?.hidden == true, "a folder whose name starts with a dot is hidden")
+            c.expect(byName["flagged"]?.hidden == true, "a folder marked hidden in Finder is hidden")
+            c.expect(byName["shown"]?.hidden == false, "an ordinary folder isn't")
+            c.expect(scanned.root.descendant(atPath: hiddenRoot + "/shown/deep/.inner")?.hidden == true,
+                     "…and so deeper down, read by another thread")
+            c.equal(scanned.root.fileCount, 6, "hidden files and folders are counted all the same")
+            let all = DetailLoader.listFiles(in: hiddenRoot, folderTotal: scanned.root.allocated, uncounted: nil).items
+            c.equal(Set(all.map(\.name)), [".dotfile", "plain"], "Details lists hidden files when they're shown")
+            c.expect(all.first { $0.name == ".dotfile" }?.hidden == true, "…marked hidden, to dim them")
+            var someShown: [String] = []
+            DetailLoader.streamFiles(in: hiddenRoot, folderTotal: scanned.root.allocated, uncounted: nil,
+                                     showHidden: false) { rows in
+                someShown += rows.map(\.name)
+                return true
+            }
+            c.equal(someShown, ["plain"], "…and leaves them out when they're not")
+            let rect = CGRect(x: 0, y: 0, width: 600, height: 400)
+            let metric: (Node) -> Double = { Double($0.allocated) }
+            let everything = TreemapBuilder.tiles(for: scanned.root, in: rect, maxDepth: 1, minSide: 1, metric: metric)
+            let noHidden = TreemapBuilder.tiles(for: scanned.root, in: rect, maxDepth: 1, minSide: 1, showHidden: false,
+                                                metric: metric)
+            c.expect(everything.contains { $0.node.name == ".dotted" }, "the treemap shows hidden folders")
+            c.expect(!noHidden.contains { $0.node.hidden }, "…or leaves them out")
+            func area(_ tiles: [TreemapTile], _ name: String) -> CGFloat {
+                tiles.first { $0.node.name == name }.map { $0.rect.width * $0.rect.height } ?? 0
+            }
+            let before = area(everything, "shown"), after = area(noHidden, "shown")
+            c.expect(before > 0 && abs(before - after) / before < 0.01,
+                     "…keeping every other tile its size (\(Int(before)) and \(Int(after)))")
+        } else {
+            c.fail("couldn't scan the folder with hidden files")
+        }
+
+        c.section("Paths shown without asking the disk")
+        // Firmlinks are checked once each; the answers match asking the disk for both paths.
+        func asked(_ a: String, _ b: String) -> Bool {
+            var x = Darwin.stat(), y = Darwin.stat()
+            return lstat(a, &x) == 0 && lstat(b, &y) == 0 && x.st_dev == y.st_dev && x.st_ino == y.st_ino
+        }
+        let data = "/System/Volumes/Data"
+        for path in [NSHomeDirectory(), "/Applications", "/Users", "/Library/Preferences", "/private/tmp",
+                     "/usr/local", "/usr/bin", "/System/Library/CoreServices", "/Volumes", f.root] {
+            let expected = asked(path, data + path) ? data + path : nil
+            c.equal(PathDisplay.onDataVolume(path), expected, "\(path) on the data volume")
+            c.equal(PathDisplay.friendly(data + path), expected == nil ? data + path : path, "\(data + path) shown as")
         }
 
         c.section("Reading a cloud folder after the scan")

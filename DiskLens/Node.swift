@@ -41,6 +41,7 @@ final class Node: Identifiable, @unchecked Sendable {
     var otherVolume = false      // a mount point for another disk; not scanned
     var cloudOnly = false        // only in the cloud (iCloud Drive, Google Drive…); not read (yet)
     var pending = false          // still being read; its contents arrive later (see `adopt`)
+    var hidden = false           // hidden in Finder (see `HiddenFiles`); counted all the same
     var unreadableCount = 0      // unreadable folders anywhere in this branch
 
     /// Hard links directly in this folder that were not counted, because the scan had already

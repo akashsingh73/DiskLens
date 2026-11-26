@@ -231,11 +231,8 @@ enum PathDisplay {
     static func friendly(_ path: String) -> String {
         guard path.hasPrefix(dataVolume + "/") else { return path }
         let candidate = String(path.dropFirst(dataVolume.count))
-        var original = stat()
-        var shortened = stat()
-        guard lstat(path, &original) == 0, lstat(candidate, &shortened) == 0,
-              original.st_dev == shortened.st_dev, original.st_ino == shortened.st_ino else { return path }
-        return candidate
+        if let known = Firmlinks.sameFolder(candidate) { return known ? candidate : path }
+        return sameFile(path, candidate) ? candidate : path
     }
 
     /// The other way round: "/Users/me" becomes "/System/Volumes/Data/Users/me" when both name the
@@ -243,11 +240,54 @@ enum PathDisplay {
     static func onDataVolume(_ path: String) -> String? {
         guard path.hasPrefix("/"), path != "/", !path.hasPrefix(dataVolume + "/"), path != dataVolume else { return nil }
         let candidate = dataVolume + path
-        var original = stat()
-        var onData = stat()
-        guard lstat(path, &original) == 0, lstat(candidate, &onData) == 0,
-              original.st_dev == onData.st_dev, original.st_ino == onData.st_ino else { return nil }
-        return candidate
+        if let known = Firmlinks.sameFolder(path) { return known ? candidate : nil }
+        return sameFile(path, candidate) ? candidate : nil
+    }
+
+    fileprivate static func sameFile(_ a: String, _ b: String) -> Bool {
+        var first = stat()
+        var second = stat()
+        return lstat(a, &first) == 0 && lstat(b, &second) == 0
+            && first.st_dev == second.st_dev && first.st_ino == second.st_ino
+    }
+
+    /// The startup disk's firmlinks (/Users, /Applications, …: listed in /usr/share/firmlinks), each
+    /// checked once. Asking the disk every time cost two lookups per path shown, several times a
+    /// second while a scan redraws its progress, on the main thread: with the disk busy (another app
+    /// copying, a backup running) each one could wait, and the window froze.
+    private enum Firmlinks {
+        private static let lock = NSLock()
+        /// The firmlinked folders, as paths from "/"; nil if the list can't be read.
+        nonisolated(unsafe) private static var roots: [String]?
+        nonisolated(unsafe) private static var loaded = false
+        /// Whether each firmlinked folder and its copy on the data volume were found to be one.
+        nonisolated(unsafe) private static var checked: [String: Bool] = [:]
+
+        /// For a path from "/": whether it names the same thing as on the data volume, as far as
+        /// the firmlinks tell (true inside a firmlinked folder that checked out, false outside
+        /// every firmlink). Nil when the firmlinks aren't known: ask the disk.
+        static func sameFolder(_ path: String) -> Bool? {
+            lock.lock()
+            defer { lock.unlock() }
+            if !loaded {
+                loaded = true
+                roots = (try? String(contentsOfFile: "/usr/share/firmlinks", encoding: .utf8))
+                    .map { list in
+                        list.split(separator: "\n").compactMap { line in
+                            line.split(separator: "\t").first.map(String.init)
+                        }.filter { $0.hasPrefix("/") && $0.count > 1 }
+                    }
+                if roots?.isEmpty ?? true { roots = nil }
+            }
+            guard let roots else { return nil }
+            // The longest firmlink the path is in (or is).
+            guard let root = roots.filter({ path == $0 || path.hasPrefix($0 + "/") }).max(by: { $0.count < $1.count })
+            else { return false }
+            if let known = checked[root] { return known }
+            let same = PathDisplay.sameFile(root, dataVolume + root)
+            checked[root] = same
+            return same
+        }
     }
 }
 
@@ -315,16 +355,21 @@ enum FileActions {
     }
 
     /// Moves an item to the Trash (never deletes outright). Shows an alert if that fails.
-    static func moveToTrash(path: String) -> Bool {
-        do {
-            try FileManager.default.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: nil)
-            return true
-        } catch {
-            Log.files.error("Couldn't move to Trash: \(path, privacy: .public): \(error.localizedDescription, privacy: .public)")
-            let failure = NSAlert(error: error)
-            failure.runModal()
-            return false
+    /// Moves an item to the Trash on a thread of its own (a busy disk can take a while to answer)
+    /// and says why if it can't.
+    static func moveToTrash(path: String) async -> Bool {
+        let failed: (any Error)? = await DiskThreads.value {
+            do {
+                try FileManager.default.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: nil)
+                return nil
+            } catch {
+                return error
+            }
         }
+        guard let failed else { return true }
+        Log.files.error("Couldn't move to Trash: \(path, privacy: .public): \(failed.localizedDescription, privacy: .public)")
+        NSAlert(error: failed).runModal()
+        return false
     }
 }
 
@@ -375,6 +420,7 @@ enum HistoryStore {
 
     /// Where DiskLens keeps its scan history (and the folder snapshots, see `SnapshotStore`).
     static var folderURL: URL {
+        if let testFolder { return testFolder }
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
         return base.appendingPathComponent("DiskLens", isDirectory: true)
@@ -382,7 +428,96 @@ enum HistoryStore {
 
     private static var fileURL: URL { folderURL.appendingPathComponent("history.json") }
 
+    /// Where the tests keep a history of their own, instead of the real one.
+    nonisolated(unsafe) static var testFolder: URL? {
+        didSet {
+            lock.lock()
+            cached = nil
+            lock.unlock()
+        }
+    }
+
+    private static let lock = NSLock()
+    /// The history, read from its file once and kept: every window reads it when any scan finishes,
+    /// on the main thread, which must not wait for a busy disk each time.
+    nonisolated(unsafe) private static var cached: [HistoryEntry]?
+    /// Changes made here and not yet in the file.
+    nonisolated(unsafe) private static var unwritten = 0
+    /// Writes the file in the background, in order.
+    private static let writer = DispatchQueue(label: "local.disklens.history", qos: .utility)
+    /// Told to every copy of DiskLens running (`open -n` starts another) when one changes the file.
+    private static let changedElsewhere = Notification.Name("local.disklens.history.changed")
+
     static func load() -> [HistoryEntry] {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached { return cached }
+        let all = readFile()
+        cached = all
+        return all
+    }
+
+    /// Makes `change` to the history: at once to what this copy of DiskLens shows, and in the
+    /// background to the file. There it is made to the file as it is then, under a lock, so another
+    /// copy of DiskLens running at the same time and changing it too doesn't lose its changes, or
+    /// this one's.
+    private static func change(_ change: @escaping @Sendable (inout [HistoryEntry]) -> Void) {
+        _ = load()
+        lock.lock()
+        if var all = cached {
+            change(&all)
+            cached = all
+        }
+        unwritten += 1
+        lock.unlock()
+        let folder = folderURL
+        let lockFile = folderURL.appendingPathComponent("history.lock")
+        writer.async {
+            var merged: [HistoryEntry]?
+            do {
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                try FileLock.withLock(lockFile) {
+                    var all = readFile()
+                    change(&all)
+                    try JSONEncoder().encode(all).write(to: fileURL, options: .atomic)
+                    merged = all
+                }
+            } catch {
+                Log.app.error("Couldn't save scan history: \(error.localizedDescription, privacy: .public)")
+            }
+            lock.lock()
+            unwritten -= 1
+            // The file now also holds what other copies of DiskLens added. With more changes of this
+            // copy still on their way, the history kept here stays as it is until the last is written.
+            if let merged, unwritten == 0 { cached = merged }
+            lock.unlock()
+            DistributedNotificationCenter.default().postNotificationName(
+                changedElsewhere, object: String(getpid()), userInfo: nil, deliverImmediately: true)
+        }
+    }
+
+    /// Follows changes other copies of DiskLens make to the history: reads the file again (in the
+    /// background) and tells this copy's windows (`didChange`, with no object). Call once at launch.
+    static func followOtherCopies() {
+        let me = String(getpid())
+        DistributedNotificationCenter.default().addObserver(forName: changedElsewhere, object: nil, queue: nil) { note in
+            guard (note.object as? String) != me else { return }
+            writer.async {
+                let all = readFile()
+                lock.lock()
+                if unwritten == 0 { cached = all }
+                lock.unlock()
+                DispatchQueue.main.async { NotificationCenter.default.post(name: didChange, object: nil) }
+            }
+        }
+    }
+
+    /// Waits until the history is written: before DiskLens quits, and for the tests.
+    static func waitForWrites() {
+        writer.sync {}
+    }
+
+    private static func readFile() -> [HistoryEntry] {
         let url = fileURL
         guard FileManager.default.fileExists(atPath: url.path) else { return [] }
         do {
@@ -404,17 +539,12 @@ enum HistoryStore {
 
     /// Replaces the entry of the same scan (same folder and time), e.g. once cloud folders were read.
     static func update(_ entry: HistoryEntry) {
-        var all = load()
-        guard let index = all.lastIndex(where: { $0.path == entry.path && $0.date == entry.date }) else {
-            append(entry)
-            return
-        }
-        all[index] = entry
-        do {
-            try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
-            try JSONEncoder().encode(all).write(to: fileURL, options: .atomic)
-        } catch {
-            Log.app.error("Couldn't save scan history: \(error.localizedDescription, privacy: .public)")
+        change { all in
+            if let index = all.lastIndex(where: { $0.path == entry.path && $0.date == entry.date }) {
+                all[index] = entry
+            } else {
+                add(entry, to: &all)
+            }
         }
     }
 
@@ -428,14 +558,49 @@ enum HistoryStore {
     }
 
     static func append(_ entry: HistoryEntry) {
-        var all = load()
+        change { add(entry, to: &$0) }
+    }
+
+    private static func add(_ entry: HistoryEntry, to all: inout [HistoryEntry]) {
         all.append(entry)
         if all.count > limit { all.removeFirst(all.count - limit) }
-        do {
-            try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
-            try JSONEncoder().encode(all).write(to: fileURL, options: .atomic)
-        } catch {
-            Log.app.error("Couldn't save scan history: \(error.localizedDescription, privacy: .public)")
+    }
+}
+
+/// A lock on a file, shared by every copy of DiskLens running (`flock`): what one copy reads,
+/// changes and writes back, no other changes in between.
+enum FileLock {
+    static func withLock<T>(_ url: URL, _ body: () throws -> T) throws -> T {
+        let fd = open(url.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o644)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { close(fd) }       // also lets go of the lock
+        while flock(fd, LOCK_EX) != 0 {
+            guard errno == EINTR else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         }
+        return try body()
+    }
+}
+
+/// How many files DiskLens may have open at once. macOS starts an app at 256: every window's scan
+/// keeps a few folders open on each of its threads, Details and Search more, and past the limit
+/// folders fail to open and come out as unreadable, so the totals come out short, with nothing
+/// actually wrong with them. Raised at launch, as far as macOS allows.
+enum OpenFileLimit {
+    static let wanted: rlim_t = 10_240
+
+    static func raise() {
+        var limit = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limit) == 0, limit.rlim_cur < wanted else { return }
+        let target = min(wanted, limit.rlim_max, rlim_t(OPEN_MAX))
+        guard target > limit.rlim_cur else { return }
+        limit.rlim_cur = target
+        if setrlimit(RLIMIT_NOFILE, &limit) != 0 {
+            Log.app.error("Couldn't raise the open file limit: \(String(cString: strerror(errno)), privacy: .public)")
+        }
+    }
+
+    static var current: rlim_t {
+        var limit = rlimit()
+        return getrlimit(RLIMIT_NOFILE, &limit) == 0 ? limit.rlim_cur : 0
     }
 }

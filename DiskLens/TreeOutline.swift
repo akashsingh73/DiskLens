@@ -147,6 +147,7 @@ struct TreeOutline: NSViewRepresentable {
         func children(of node: Node) -> [Node] {
             if let cached = cache[node.id] { return cached }
             var list: [Node] = node.kind == .directory ? node.children : []
+            if !settings.showHidden { list.removeAll(where: \.hidden) }
             if settings.showFilesNode, let files = node.filesNode { list.append(files) }
             if settings.hideBelowBytes > 0 {
                 let limit = settings.hideBelowBytes
@@ -390,7 +391,7 @@ final class TreeCellView: NSTableCellView {
         let bold = node !== root && rootShare * 100 >= settings.boldPercent && settings.boldPercent > 0
         nameLabel.font = bold ? .boldSystemFont(ofSize: NSFont.systemFontSize) : .systemFont(ofSize: NSFont.systemFontSize)
         nameLabel.textColor = node.unreadable || node.otherVolume || node.cloudOnly || node.pending
-            ? .secondaryLabelColor : .labelColor
+            ? .secondaryLabelColor : node.hidden ? .tertiaryLabelColor : .labelColor
 
         switch true {
         case node.kind == .files: icon.image = Self.filesIcon

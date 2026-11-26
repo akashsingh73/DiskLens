@@ -135,6 +135,7 @@ enum Prefs {
     static let boldPercent = "boldPercent"
     static let hideBelowMB = "hideBelowMB"
     static let showFilesNode = "showFilesNode"
+    static let showHidden = "showHiddenFiles"
     static let sortByName = "sortByName"
     static let treemapDepth = "treemapDepth"
     static let treemapMinTile = "treemapMinTile"
@@ -171,6 +172,9 @@ struct DisplaySettings: Equatable {
     var hideBelowMB: Double
     var showFilesNode: Bool
     var sortByName: Bool
+    /// List hidden files and folders (see `HiddenFiles`), dimmed as in Finder. Off, they're left out
+    /// of the lists, but still counted in every folder's size.
+    var showHidden: Bool = true
 
     var hideBelowBytes: Int64 { Int64(hideBelowMB * 1_000_000) }
     var barStart: NSColor { NSColor(hex: barStartHex) ?? .systemBlue }
@@ -219,13 +223,14 @@ struct DisplayPrefs: DynamicProperty {
     @AppStorage(Prefs.hideBelowMB) var hideBelowMB: Double = 0
     @AppStorage(Prefs.showFilesNode) var showFilesNode: Bool = true
     @AppStorage(Prefs.sortByName) var sortByName: Bool = false
+    @AppStorage(Prefs.showHidden) var showHidden: Bool = true
 
     var settings: DisplaySettings {
         DisplaySettings(mode: mode, unit: unit, base: base, decimals: decimals,
                         showBars: showBars, barScale: barScale,
                         barStartHex: barStartHex, barEndHex: barEndHex,
                         boldPercent: boldPercent, hideBelowMB: hideBelowMB,
-                        showFilesNode: showFilesNode, sortByName: sortByName)
+                        showFilesNode: showFilesNode, sortByName: sortByName, showHidden: showHidden)
     }
 }
 

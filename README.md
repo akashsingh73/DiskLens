@@ -109,7 +109,9 @@ ad-hoc signature, so use `build.sh` for the copy you keep in Applications.
 | To | Do this |
 | --- | --- |
 | Scan | ⌘O to choose a folder (or drop one onto the window), ⇧⌘H for your home folder, ⌘R to rescan, ⌘. to stop |
-| Scan several things at once | ⌘N for a new window: each window has its own scan, view and Back / Forward |
+| Scan several things at once | ⌘N (or right-click DiskLens in the Dock ▸ New Window) for a new window: each window has its own scan, view and Back / Forward, and a slow or stopped scan in one never holds up another |
+| Another DiskLens | ⌥⌘N, File ▸ New Instance, or the Dock menu ▸ New Instance: a separate copy of the app, like a second VS Code, with windows and memory of its own |
+| Hidden files | ⇧⌘. or View ▸ Show Hidden Files (as in Finder). Shown, they're dimmed; hidden, they're left out of the tree, Details and treemap, but always counted in folder sizes |
 | Open a folder | Double-click it (or select it and press Return) in Details or the Treemap, or click it in the tree or the chart legend |
 | Go back up | Click any folder in the path bar above the views, or press ⌘↑ |
 | Back / Forward | The arrow buttons at the top left, ⌘[ and ⌘], or the side buttons on your mouse |
@@ -198,8 +200,17 @@ A few rules keep DiskLens stable; please keep to them:
 - **Speed**: a few workers share a queue of folders; a busy worker hands subfolders to idle ones (`WorkQueue`),
   so lopsided folders don't leave workers idle. There are at most six (`ScanEngine.readers`): reading folders is
   almost all work inside macOS's file system, where more threads only wait on each other. Scans in different
-  windows take turns at the same disk's readers (`DiskReaders`). Sorting table rows goes
+  windows take turns at the same disk's readers (`DiskReaders`); a stopped scan gives its readers back at once,
+  even while its threads are still stuck on a busy disk. Sorting table rows goes
   through `FastSort`, not `sorted(using:)`. Measure before and after any change to the scanner.
+- **Never wait on the disk where it can freeze things**: the main thread never reads the disk, and nothing that
+  does runs on Swift's shared `async` threads or in `concurrentPerform`. Scans, Details, Search, free space and
+  snapshots read on threads of their own (`DiskThreads`), so a drive that is busy, waking up or not answering
+  slows only what reads it. Stop lets go of a scan (or of reading cloud folders) at once rather than waiting for
+  its threads, and a scan that hasn't read anything for a few seconds says what it is waiting for. DiskLens raises
+  its open-file limit at launch (`OpenFileLimit`), so many windows at once never run out and miscount folders.
+- **Several copies of DiskLens at once** (`open -n`): the scan history and snapshots are changed under a file lock
+  (`FileLock`), so copies saving at the same moment keep each other's scans, and each copy shows the others'.
 - **Never wait on the cloud during a scan**: scan threads run with cloud fetching turned off (`CloudFiles`).
 - **Big folders stay responsive**: Details and the folder tree are AppKit tables, which only make the rows on
   screen, so a folder of 63,000 files lists in about a third of a second (SwiftUI's `Table` froze the window for

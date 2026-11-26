@@ -17,6 +17,8 @@ struct DetailItem: Identifiable, Hashable, Sendable {
     let kind: String
     var percent: Double         // share of the folder's space on disk
     let unreadable: Bool
+    /// Hidden in Finder (see `HiddenFiles`): shown dimmed.
+    var hidden = false
     /// Set for a hard link whose space the scan counted through another link to the same file.
     /// Its On Disk is 0, because moving it to the Trash frees nothing.
     var uncountedLink: FileKey? = nil
@@ -32,7 +34,7 @@ struct DetailItem: Identifiable, Hashable, Sendable {
     static func == (lhs: DetailItem, rhs: DetailItem) -> Bool {
         lhs.id == rhs.id && lhs.change == rhs.change && lhs.allocated == rhs.allocated && lhs.size == rhs.size
             && lhs.files == rhs.files && lhs.folders == rhs.folders && lhs.kind == rhs.kind
-            && lhs.percent == rhs.percent && lhs.modified == rhs.modified
+            && lhs.percent == rhs.percent && lhs.modified == rhs.modified && lhs.hidden == rhs.hidden
     }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
@@ -80,13 +82,15 @@ enum DetailLoader {
     /// on this thread and returns false to stop. False if the folder can't be read, or reading it
     /// failed partway (the rows delivered so far are then only some of its files).
     @discardableResult
-    static func streamFiles(in path: String, folderTotal: Int64, uncounted: [FileKey: Int]?,
+    static func streamFiles(in path: String, folderTotal: Int64, uncounted: [FileKey: Int]?, showHidden: Bool = true,
                             deliver: ([DetailItem]) -> Bool) -> Bool {
         let folderPrefix = path.hasSuffix("/") ? path : path + "/"
         let readable = FolderReader.files(in: path, uncounted: uncounted) { files in
             var rows: [DetailItem] = []
             rows.reserveCapacity(files.count)
             for file in files {
+                let hidden = HiddenFiles.isHidden(name: file.name, flags: file.facts.flags)
+                if hidden && !showHidden { continue }
                 let filePath = folderPrefix + file.name
                 let allocated = file.counted ? file.facts.allocated : 0
                 rows.append(DetailItem(
@@ -96,6 +100,7 @@ enum DetailLoader {
                     kind: file.counted ? KindNames.kind(of: file, at: filePath) : uncountedLinkKind,
                     percent: folderTotal > 0 ? Double(allocated) / Double(folderTotal) : 0,
                     unreadable: false,
+                    hidden: hidden,
                     uncountedLink: file.counted ? nil : file.facts.key))
             }
             return deliver(rows)
@@ -208,6 +213,7 @@ struct DetailsView: View {
         let version: Int
         /// The earlier scan the Change column compares with.
         let comparedWith: Date?
+        let showHidden: Bool
     }
 
     var body: some View {
@@ -234,7 +240,8 @@ struct DetailsView: View {
             }
             .animation(.easeOut(duration: 0.15), value: state.loading && state.showProgress)
             .animation(.easeOut(duration: 0.15), value: state.sortingFiles != nil)
-            .task(id: LoadKey(node: node.id, version: model.version, comparedWith: model.changes?.base.date)) {
+            .task(id: LoadKey(node: node.id, version: model.version, comparedWith: model.changes?.base.date,
+                              showHidden: settings.showHidden)) {
                 await reload()
             }
             .onChange(of: model.fileToHighlight) { showPendingFile() }
@@ -296,7 +303,7 @@ struct DetailsView: View {
         // While a scan fills in, the tree changes twice a second, mostly somewhere else: the folder
         // shown here is listed again only if something in it changed.
         let signature = DetailsState.Signature(directory, filesOnly: node.kind == .files,
-                                               comparedWith: model.changes?.base.date)
+                                               comparedWith: model.changes?.base.date, showHidden: settings.showHidden)
         if state.shownFolder == ObjectIdentifier(directory), state.shownSignature == signature,
            state.listedFolder != nil {
             return
@@ -312,7 +319,7 @@ struct DetailsView: View {
         var lookup: [String: Node] = [:]
         if node.kind == .directory {
             folderRows.reserveCapacity(directory.children.count)
-            for child in directory.children {
+            for child in directory.children where settings.showHidden || !child.hidden {
                 let childPath = (path as NSString).appendingPathComponent(child.name)
                 lookup[childPath] = child
                 let kind = child.otherVolume ? "Other disk" : child.cloudOnly ? "In the cloud" : child.pending ? "Reading…" : (child.unreadable ? "No access" : "Folder")
@@ -325,6 +332,7 @@ struct DetailsView: View {
                     kind: kind,
                     percent: total > 0 ? Double(child.allocated) / Double(total) : 0,
                     unreadable: child.unreadable,
+                    hidden: child.hidden,
                     change: relative.flatMap { comparison?.change(at: $0) }))
             }
         }
@@ -344,7 +352,8 @@ struct DetailsView: View {
         // rarely change while a scan fills in the rest of the tree, so this outlives the redraws.
         let filesKey = DetailsState.FilesKey(folder: folderID, ownFiles: directory.ownFileCount,
                                              ownAllocated: directory.ownAllocated,
-                                             uncountedLinks: uncounted?.values.reduce(0, +) ?? 0)
+                                             uncountedLinks: uncounted?.values.reduce(0, +) ?? 0,
+                                             showHidden: settings.showHidden)
         state.signatureToShow = signature
         if state.isReading(filesKey) {
             // Still being read: show the new folder rows with the files so far, and let it finish.
@@ -544,6 +553,8 @@ final class DetailsState: ObservableObject {
         let ownAllocated: Int64
         /// Hard links counted elsewhere: moving one to the Trash changes the list, not the totals.
         let uncountedLinks: Int
+        /// Hidden files listed: switching it reads the files again.
+        let showHidden: Bool
     }
 
     /// A folder's files as read, in reading order and sorted (showing them again in the same order
@@ -606,6 +617,7 @@ final class DetailsState: ObservableObject {
         // The files are read into an empty list (`DetailsView.reload` has emptied it already).
         if !files.isEmpty || filesKey != nil { show(folders: folders, files: [], total: self.total) }
         let total = folder.allocated
+        let showHidden = key.showHidden
         let task = Task { @MainActor [weak self] in
             let stop = ScanProgress()
             // The rows wait in `inbox`, and the main thread takes all there are each time it is told
@@ -615,15 +627,19 @@ final class DetailsState: ObservableObject {
             let inbox = DetailInbox()
             let (news, notify) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
             notify.onTermination = { _ in stop.cancel() }   // also when this task is cancelled
-            let reader = Task.detached(priority: .userInitiated) {
-                let complete = DetailLoader.streamFiles(in: path, folderTotal: total, uncounted: uncounted) { rows in
-                    guard !stop.isCancelled else { return false }
-                    inbox.add(rows)
-                    notify.yield()
-                    return true
+            // On a thread of its own (see `DiskThreads`): with the disk busy, the folder can take a while.
+            let reader = Task {
+                await DiskThreads.value {
+                    let complete = DetailLoader.streamFiles(in: path, folderTotal: total, uncounted: uncounted,
+                                                              showHidden: showHidden) { rows in
+                        guard !stop.isCancelled else { return false }
+                        inbox.add(rows)
+                        notify.yield()
+                        return true
+                    }
+                    notify.finish()
+                    return complete
                 }
-                notify.finish()
-                return complete
             }
             var shown = Date.distantPast
             var counted = Date.distantPast
@@ -736,8 +752,10 @@ final class DetailsState: ObservableObject {
         /// Showing only the folder's own files (its "[Files]" entry), not its subfolders.
         let filesOnly: Bool
         let comparedWith: Date?
+        let showHidden: Bool
 
-        init(_ folder: Node, filesOnly: Bool, comparedWith: Date?) {
+        init(_ folder: Node, filesOnly: Bool, comparedWith: Date?, showHidden: Bool) {
+            self.showHidden = showHidden
             size = folder.size
             allocated = folder.allocated
             files = folder.fileCount
@@ -1369,7 +1387,7 @@ final class DetailsTextCell: NSTableCellView {
 final class DetailsNameCell: NSTableCellView {
     private let icon = NSImageView()
     private let label = NSTextField(labelWithString: "")
-    private var shown: (name: String, image: NSImage, unreadable: Bool)?
+    private var shown: (name: String, image: NSImage, unreadable: Bool, hidden: Bool)?
 
     init() {
         super.init(frame: .zero)
@@ -1388,11 +1406,14 @@ final class DetailsNameCell: NSTableCellView {
 
     func show(_ item: DetailItem) {
         let image = IconCache.icon(for: item)
-        if let shown, shown.name == item.name, shown.image === image, shown.unreadable == item.unreadable { return }
-        shown = (item.name, image, item.unreadable)
+        if let shown, shown.name == item.name, shown.image === image, shown.unreadable == item.unreadable,
+           shown.hidden == item.hidden { return }
+        shown = (item.name, image, item.unreadable, item.hidden)
         icon.image = image
+        // Hidden items dimmed, as Finder shows them.
+        icon.alphaValue = item.hidden ? 0.5 : 1
         label.stringValue = item.name
-        label.textColor = item.unreadable ? .secondaryLabelColor : .labelColor
+        label.textColor = item.unreadable ? .secondaryLabelColor : item.hidden ? .tertiaryLabelColor : .labelColor
     }
 
     override func layout() {

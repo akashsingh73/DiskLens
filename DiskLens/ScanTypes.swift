@@ -265,6 +265,28 @@ final class ScanResult: @unchecked Sendable {
         absorb(piece.stats)
     }
 
+    /// After reading the cloud folders was stopped without waiting for its threads (see
+    /// `AppModel.stopReadingCloud`): what it never delivered is put back the way it was. Folders
+    /// handed off inside a folder that did arrive, still waiting to be read, become folders in the
+    /// cloud again (to read next time); pieces waiting for a piece that never came are dropped, and
+    /// the hard links they counted first are forgotten, so a new read counts them. Main thread.
+    func putBackUnread() {
+        let dropped = Array(waitingPieces.values)
+        waitingPieces.removeAll()
+        links.forget(dropped.flatMap(\.stats.firstSightings))
+        var stack = [root]
+        while let node = stack.popLast() {
+            if node.pending {
+                node.pending = false
+                node.cloudOnly = true
+                cloudOnlyFolders += 1
+                cloudFolders.append(CloudFolder(path: node.path, name: node.name, node: node))
+                continue
+            }
+            stack.append(contentsOf: node.children)
+        }
+    }
+
     /// The clock the scan measured file ages against (seconds since 1970).
     var scanTime: Int64 { Int64(started.timeIntervalSince1970) }
 

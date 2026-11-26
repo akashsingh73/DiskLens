@@ -5,6 +5,47 @@ import Darwin
 import Glibc
 #endif
 
+/// Threads for reading the disk.
+///
+/// Reading a folder can wait in macOS for a long time: a drive spinning up, another app copying or
+/// a backup keeping the disk busy, a network drive that stopped answering. Waits like that must
+/// never happen on the main thread (the window freezes), nor on the threads Swift's `async` tasks
+/// share (there are only as many as cores; with a few of them waiting on the disk, everything else
+/// written with `async`, like sorting Details, waits too), nor in `concurrentPerform` (it shares
+/// GCD's threads with every window's scan, and with the disk stuck its work could wait for them).
+enum DiskThreads {
+    /// Runs `body(0)`, `body(1)`, … `body(count - 1)` each on a thread of its own and returns once
+    /// all of them have.
+    static func run(_ count: Int, qos: QualityOfService = .userInitiated,
+                    _ body: @escaping @Sendable (Int) -> Void) {
+        let group = DispatchGroup()
+        for index in 0..<count {
+            group.enter()
+            start(qos: qos) {
+                body(index)
+                group.leave()
+            }
+        }
+        group.wait()
+    }
+
+    /// Runs `body` on a thread of its own, without waiting for it.
+    static func start(qos: QualityOfService = .userInitiated, _ body: @escaping @Sendable () -> Void) {
+        let thread = Thread(block: body)
+        thread.qualityOfService = qos
+        thread.stackSize = 1 << 20
+        thread.start()
+    }
+
+    /// Runs `body` on a thread of its own and waits for it without holding up any other task.
+    static func value<T: Sendable>(qos: QualityOfService = .userInitiated,
+                                   _ body: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            start(qos: qos) { continuation.resume(returning: body()) }
+        }
+    }
+}
+
 /// Thread-safe progress counters and the cancel flag for one scan.
 final class ScanProgress: @unchecked Sendable {
     enum Phase: Sendable {
@@ -27,12 +68,15 @@ final class ScanProgress: @unchecked Sendable {
         var branchesDone = 0
         /// The folders being read right now, longest-running first.
         var reading: [String] = []
+        /// Nothing is being read: every reader of the disk is busy with another window's scan.
+        var waitingForOtherScan = false
     }
 
     private let lock = NSLock()
     private var snapshot = Snapshot()
     private var active: [Int: (path: String, since: Date)] = [:]
     private var cancelled = false
+    private var waitingForReaders = 0
 
     func add(files: Int, folders: Int, bytes: Int64, currentPath: String?) {
         lock.lock()
@@ -82,12 +126,20 @@ final class ScanProgress: @unchecked Sendable {
         defer { lock.unlock() }
         var copy = snapshot
         copy.reading = active.values.sorted { $0.since < $1.since }.map(\.path)
+        copy.waitingForOtherScan = waitingForReaders > 0 && active.isEmpty && copy.phase == .reading
         return copy
     }
 
     func cancel() {
         lock.lock()
         cancelled = true
+        lock.unlock()
+    }
+
+    /// A worker started or stopped waiting for a reader of the disk (see `DiskReaderPool`).
+    func waitingForReader(_ waiting: Bool) {
+        lock.lock()
+        waitingForReaders += waiting ? 1 : -1
         lock.unlock()
     }
 
@@ -196,6 +248,15 @@ struct FileFacts {
         #else
         return UInt64(device)
         #endif
+    }
+}
+
+/// What Finder hides: names starting with a dot (".git", ".Trash") and items marked hidden
+/// (`chflags hidden`, like ~/Library). DiskLens always counts them: they take space like anything
+/// else. "Show Hidden Files" (⇧⌘.) only decides whether they're listed.
+enum HiddenFiles {
+    static func isHidden(name: String, flags: UInt32) -> Bool {
+        name.utf8.first == UInt8(ascii: ".") || flags & UInt32(UF_HIDDEN) != 0
     }
 }
 
@@ -754,7 +815,7 @@ struct CountedFiles: Sendable {
         let readers = ScanEngine.readers
         let slots = ResultSlots<CountedFiles>(count: readers)
         // As many threads as a scan uses (see `ScanEngine.readers`), each taking every n-th folder.
-        DispatchQueue.concurrentPerform(iterations: readers) { reader in
+        DiskThreads.run(readers) { reader in
             var counted = CountedFiles()
             for index in stride(from: reader, to: folders.count, by: readers) {
                 if progress.isCancelled { break }
@@ -762,6 +823,7 @@ struct CountedFiles: Sendable {
                 // Batch by batch: a big folder stops as soon as the count is cancelled, and a folder
                 // whose reading fails partway still counts the files read.
                 FolderReader.files(in: folder.path, uncounted: folder.uncounted) { batch in
+                    progress.add(files: batch.count, folders: 0, bytes: 0, currentPath: nil)   // see `AppModel.trash`
                     for file in batch where file.counted {
                         if file.facts.links > 1 {
                             counted.linked.append(LinkedFile(path: (folder.path as NSString).appendingPathComponent(file.name),

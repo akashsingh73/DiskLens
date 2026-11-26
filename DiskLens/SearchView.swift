@@ -198,7 +198,7 @@ final class SearchModel: ObservableObject {
         let search = FileSearch(index: index, query: query, bySize: bySize)
         fileSearch = search
         reading = 0
-        DispatchQueue.global(qos: .userInitiated).async { search.run() }
+        DiskThreads.start { search.run() }
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: 150_000_000)
             guard !Task.isCancelled, fileSearch === search else { return }

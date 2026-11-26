@@ -552,6 +552,15 @@ func pathInsideScan(_ path: String, root: String) -> String {
 
 /// In the summary card while a scan is still being read: how far it got, which folders it is
 /// on (the slow ones stay at the top), and Stop. Redraws on its own, four times a second.
+/// What a scan that isn't getting anywhere is waiting for, or nil while it is reading.
+enum ScanWaitText {
+    static func text(_ snapshot: ScanProgress.Snapshot, stalled: Bool) -> String? {
+        if snapshot.waitingForOtherScan { return "Waiting for another window's scan of this disk…" }
+        if stalled { return "Waiting for the disk to respond…" }
+        return nil
+    }
+}
+
 struct LiveScanStrip: View {
     @ObservedObject var status: ScanStatus
     let rootPath: String
@@ -595,6 +604,7 @@ struct LiveScanStrip: View {
     }
 
     private func phaseText(_ snapshot: ScanProgress.Snapshot) -> String {
+        if let waiting = ScanWaitText.text(snapshot, stalled: status.stalled) { return waiting }
         switch snapshot.phase {
         case .listing: return "Listing folders…"
         case .reading:
@@ -820,6 +830,12 @@ struct ScanProgressPanel: View {
             .font(.caption)
             .foregroundStyle(.secondary)
             .frame(maxWidth: 520)
+
+            if let waiting = ScanWaitText.text(snapshot, stalled: status.stalled) {
+                Label(waiting, systemImage: "hourglass")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
 
             Button(action: stop) {
                 Label("Stop", systemImage: "stop.fill")

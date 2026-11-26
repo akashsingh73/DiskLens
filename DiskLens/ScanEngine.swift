@@ -88,7 +88,8 @@ enum ScanEngine {
             acc.cloudFolders = [job.folder]
             deliver(ScanPiece(placeholder: job.folder.node, contents: contents, stats: acc))
         }
-        DispatchQueue.concurrentPerform(iterations: workers) { _ in
+        // Threads of their own rather than GCD's shared ones (see `DiskThreads`).
+        DiskThreads.run(workers, qos: fetchCloud ? .utility : .userInitiated) { _ in
             func work() {
                 while let job = queue.next() {
                     defer { queue.finished() }
@@ -97,7 +98,7 @@ enum ScanEngine {
                         putBackInCloud(job)
                         continue
                     }
-                    if let slots, !take(slots, unlessStopped: progress) {
+                    if let slots, !slots.take(for: progress) {
                         queue.stop()
                         putBackInCloud(job)
                         continue
@@ -108,7 +109,7 @@ enum ScanEngine {
                     var acc = ScanAccumulator(topCount: topCount)
                     scanBranch(path: folder.path, root: contents, rootDevice: rootDevice, acc: &acc, links: links,
                                progress: progress, now: now, fetchCloud: fetchCloud, split: queue)
-                    slots?.signal()
+                    slots?.giveBack(for: progress)
                     if contents.cloudOnly {
                         acc.cloudFolders.append(CloudFolder(path: folder.path, name: folder.name, node: folder.node))
                     }
@@ -120,21 +121,14 @@ enum ScanEngine {
                         putBackInCloud(job)
                         continue
                     }
-                    acc.firstSightings = []      // only needed until it's delivered
+                    // Kept with the piece: if it is never filled in (see `ScanResult.putBackUnread`),
+                    // the hard links it counted first are forgotten.
                     deliver(ScanPiece(placeholder: folder.node, contents: contents, stats: acc))
                 }
             }
             if fetchCloud { work() } else { CloudFiles.withoutFetching(work) }
         }
         queue.leftOver().forEach(putBackInCloud)
-    }
-
-    /// Waits for a free reader of the disk; false if the scan is stopped first.
-    private static func take(_ slots: DispatchSemaphore, unlessStopped progress: ScanProgress) -> Bool {
-        while slots.wait(timeout: .now() + .milliseconds(100)) == .timedOut {
-            if progress.isCancelled { return false }
-        }
-        return true
     }
 
     private static func streamLocally(path: String, displayName: String, topCount: Int, progress: ScanProgress,
@@ -169,13 +163,14 @@ enum ScanEngine {
 
         // Read the first two levels directly, then scan each deeper branch on its own core.
         let firstLevel = listFolder(path: path, folder: root, rootDevice: rootDevice,
-                                    acc: &main, links: links, now: now)
+                                    acc: &main, links: links, now: now, progress: progress)
         var jobs: [(path: String, node: Node)] = []
         for entry in firstLevel {
             if progress.isCancelled { return .cancelled }
             jobs += listFolder(path: entry.path, folder: entry.node, rootDevice: rootDevice,
-                               acc: &main, links: links, now: now)
+                               acc: &main, links: links, now: now, progress: progress)
         }
+        if progress.isCancelled { return .cancelled }
         main.flush(to: progress, currentPath: path)
 
         // The first two levels become the tree on screen; the folders below them are read next,
@@ -216,7 +211,7 @@ enum ScanEngine {
     /// Lists one folder directly: adds its files to `folder` and returns subfolders still to scan.
     static func listFolder(path: String, folder: Node, rootDevice: UInt64,
                            acc: inout ScanAccumulator, links: HardLinkRegistry,
-                           now: Int64) -> [(path: String, node: Node)] {
+                           now: Int64, progress: ScanProgress? = nil) -> [(path: String, node: Node)] {
         guard let dir = opendir(path) else {
             if CloudFiles.isCloudOnly(errorCode: errno) {
                 folder.cloudOnly = true
@@ -231,8 +226,15 @@ enum ScanEngine {
         defer { closedir(dir) }
         let fd = dirfd(dir)
         var subfolders: [(path: String, node: Node)] = []
+        var counter = 0
 
         while true {
+            // A folder of a million files near the top: show how far it got, and stop when told to.
+            counter += 1
+            if counter & 0x3FF == 0, let progress {
+                acc.flush(to: progress, currentPath: path)
+                if progress.isCancelled { return subfolders }
+            }
             // readdir returns nil both at the end and on an error; only an error sets errno.
             errno = 0
             guard let entry = readdir(dir) else { break }
@@ -249,6 +251,7 @@ enum ScanEngine {
 
             if facts.isDirectory {
                 let child = Node(name: name, parent: folder)
+                child.hidden = HiddenFiles.isHidden(name: name, flags: facts.flags)
                 folder.children.append(child)
                 acc.pendingFolders += 1
                 if facts.device == rootDevice { acc.addFolderSpace(facts.allocated, to: child) }
@@ -338,6 +341,8 @@ enum ScanEngine {
                 guard stack.count == level else { continue }
                 let parentNode = stack[level - 1]
                 let child = Node(name: entryName(entry), parent: parentNode)
+                child.hidden = HiddenFiles.isHidden(name: child.name,
+                                                    flags: entry.pointee.fts_statp.map { UInt32($0.pointee.st_flags) } ?? 0)
                 parentNode.children.append(child)
                 let sameDisk = FileFacts.normalize(entry.pointee.fts_dev) == rootDevice
                 if sameDisk, let st = entry.pointee.fts_statp {
@@ -397,6 +402,8 @@ enum ScanEngine {
                 } else if stack.count >= level {
                     let parentNode = stack[level - 1]
                     let child = Node(name: entryName(entry), parent: parentNode)
+                    child.hidden = HiddenFiles.isHidden(name: child.name,
+                                                        flags: entry.pointee.fts_statp.map { UInt32($0.pointee.st_flags) } ?? 0)
                     if FileFacts.normalize(entry.pointee.fts_dev) == rootDevice, let st = entry.pointee.fts_statp {
                         acc.addFolderSpace(FileFacts(st.pointee).allocated, to: child)
                     }
@@ -456,16 +463,86 @@ enum ScanEngine {
 /// (the Mac and an external drive, say) don't wait for each other.
 enum DiskReaders {
     private static let lock = NSLock()
-    /// One semaphore per disk scanned since DiskLens opened; kept, since a semaphore must not be
-    /// freed while a scan holds part of it.
-    nonisolated(unsafe) private static var byDisk: [UInt64: DispatchSemaphore] = [:]
+    /// One pool per disk scanned since DiskLens opened.
+    nonisolated(unsafe) private static var byDisk: [UInt64: DiskReaderPool] = [:]
 
-    static func slots(for device: UInt64) -> DispatchSemaphore {
+    static func slots(for device: UInt64) -> DiskReaderPool {
         lock.lock()
         defer { lock.unlock() }
         if let slots = byDisk[device] { return slots }
-        let slots = DispatchSemaphore(value: ScanEngine.readers)
+        let slots = DiskReaderPool(capacity: ScanEngine.readers)
         byDisk[device] = slots
         return slots
+    }
+}
+
+/// A disk's readers (see `DiskReaders`), each held by one scan at a time.
+///
+/// A scan that was stopped gives its readers back at once, even while its threads are still
+/// inside macOS: on a disk that is waking up or busy with another app, a folder can take minutes
+/// to answer, and a scan started meanwhile must not wait for that. (Those threads, once back,
+/// stop without reading further.)
+final class DiskReaderPool: @unchecked Sendable {
+    private let condition = NSCondition()
+    let capacity: Int
+    private var inUse = 0
+    private var holders: [ObjectIdentifier: (scan: ScanProgress, count: Int)] = [:]
+
+    init(capacity: Int) {
+        self.capacity = capacity
+    }
+
+    /// Waits for a free reader for `scan`; false if the scan is stopped first.
+    func take(for scan: ScanProgress) -> Bool {
+        let id = ObjectIdentifier(scan)
+        condition.lock()
+        var waited = false
+        defer {
+            if waited { scan.waitingForReader(false) }
+            condition.unlock()
+        }
+        while true {
+            if scan.isCancelled { return false }
+            reclaimStopped()
+            if inUse < capacity {
+                inUse += 1
+                holders[id, default: (scan, 0)].count += 1
+                return true
+            }
+            if !waited {
+                waited = true
+                scan.waitingForReader(true)
+            }
+            // Woken when a reader is given back; the timeout also notices a stop (this scan's or a holder's).
+            condition.wait(until: Date(timeIntervalSinceNow: 0.1))
+        }
+    }
+
+    /// Gives back a reader `scan` took (nothing, if it was taken back when the scan stopped).
+    func giveBack(for scan: ScanProgress) {
+        let id = ObjectIdentifier(scan)
+        condition.lock()
+        defer { condition.unlock() }
+        guard let holder = holders[id] else { return }
+        inUse -= 1
+        holders[id] = holder.count > 1 ? (holder.scan, holder.count - 1) : nil
+        condition.signal()
+    }
+
+    /// Readers free right now (for the tests).
+    var free: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        reclaimStopped()
+        return capacity - inUse
+    }
+
+    /// Takes back the readers of scans that were stopped. Holds the lock.
+    private func reclaimStopped() {
+        for (id, holder) in holders where holder.scan.isCancelled {
+            inUse -= holder.count
+            holders[id] = nil
+            condition.broadcast()
+        }
     }
 }

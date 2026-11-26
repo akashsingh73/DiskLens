@@ -83,21 +83,25 @@ enum Squarify {
 enum TreemapBuilder {
     static let headerHeight: CGFloat = 18
 
-    static func tiles(for root: Node, in rect: CGRect, maxDepth: Int, minSide: CGFloat,
+    /// With `showHidden` off, hidden folders (see `HiddenFiles`) are left out, and the space they
+    /// take is left empty rather than given to the others, so every tile keeps its true size.
+    static func tiles(for root: Node, in rect: CGRect, maxDepth: Int, minSide: CGFloat, showHidden: Bool = true,
                       metric: (Node) -> Double) -> [TreemapTile] {
         var tiles: [TreemapTile] = []
         add(root, rect: rect, depth: 0, branch: -1, maxDepth: maxDepth, minSide: minSide,
-            metric: metric, into: &tiles)
+            showHidden: showHidden, metric: metric, into: &tiles)
         return tiles
     }
 
     private static func add(_ node: Node, rect: CGRect, depth: Int, branch: Int, maxDepth: Int,
-                            minSide: CGFloat, metric: (Node) -> Double, into tiles: inout [TreemapTile]) {
+                            minSide: CGFloat, showHidden: Bool, metric: (Node) -> Double,
+                            into tiles: inout [TreemapTile]) {
         let index = tiles.count
         tiles.append(TreemapTile(node: node, rect: rect, depth: depth, branch: branch, isLeaf: true))
         guard depth < maxDepth, node.kind == .directory else { return }
 
-        var items = node.children.filter { metric($0) > 0 }
+        var items = node.children.filter { metric($0) > 0 && (showHidden || !$0.hidden) }
+        let hiddenSpace = showHidden ? 0 : node.children.reduce(0) { $1.hidden ? $0 + metric($1) : $0 }
         if let files = node.filesNode, metric(files) > 0 { items.append(files) }
         guard !items.isEmpty else { return }
         items.sort { metric($0) > metric($1) }
@@ -113,7 +117,8 @@ enum TreemapBuilder {
         }
         guard inner.width > minSide, inner.height > minSide else { return }
 
-        let rects = Squarify.layout(items.map(metric), in: inner)
+        // The hidden folders' space comes last, as a gap that isn't drawn.
+        let rects = Squarify.layout(items.map(metric) + (hiddenSpace > 0 ? [hiddenSpace] : []), in: inner)
         var drewChild = false
         for (offset, child) in items.enumerated() {
             let childRect = rects[offset]
@@ -121,7 +126,7 @@ enum TreemapBuilder {
             drewChild = true
             let childBranch = depth == 0 ? offset : branch
             add(child, rect: childRect, depth: depth + 1, branch: childBranch, maxDepth: maxDepth,
-                minSide: minSide, metric: metric, into: &tiles)
+                minSide: minSide, showHidden: showHidden, metric: metric, into: &tiles)
         }
         tiles[index].isLeaf = !drewChild
     }
@@ -135,6 +140,7 @@ struct TreemapLayoutKey: Equatable {
     let depth: Int
     let minTile: Double
     let mode: SizeMode
+    let showHidden: Bool
 }
 
 /// TreeSize-style treemap: nested tiles, area = size, colored by depth or by top-level folder.
@@ -254,7 +260,8 @@ private struct TreemapTiles: View, Equatable {
 
     private func layout(for size: CGSize) -> [TreemapTile] {
         let key = TreemapLayoutKey(node: scope.id, version: version, size: size,
-                                   depth: max(1, maxDepth), minTile: max(2, minTile), mode: settings.mode)
+                                   depth: max(1, maxDepth), minTile: max(2, minTile), mode: settings.mode,
+                                   showHidden: settings.showHidden)
         let mode = settings.mode
         let scope = self.scope
         return state.layoutTiles(for: key) {
@@ -267,7 +274,8 @@ private struct TreemapTiles: View, Equatable {
                 }
             }
             return TreemapBuilder.tiles(for: scope, in: CGRect(origin: .zero, size: size),
-                                        maxDepth: key.depth, minSide: CGFloat(key.minTile), metric: metric)
+                                        maxDepth: key.depth, minSide: CGFloat(key.minTile),
+                                        showHidden: key.showHidden, metric: metric)
         }
     }
 

@@ -451,7 +451,7 @@ final class FileSearch: @unchecked Sendable {
         let readers = ScanEngine.readers
         // As many threads as a scan uses (see `ScanEngine.readers`), each taking every n-th chunk,
         // so the biggest folders are still read first. Matches show up chunk by chunk.
-        DispatchQueue.concurrentPerform(iterations: readers) { reader in
+        DiskThreads.run(readers) { [self] reader in
             for chunk in stride(from: reader, to: chunks, by: readers) {
                 var local = LargestHits(capacity: limit, bySize: bySize)
                 var read = 0

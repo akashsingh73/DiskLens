@@ -347,32 +347,39 @@ struct SnapshotStore: Sendable {
     /// of earlier scans of a folder that contains it. Call it off the main thread (it reads and writes a file).
     func record(_ snapshot: FolderSnapshot) -> [FolderSnapshot] {
         Self.queue.sync {
-            guard var all = load() else {
-                // Written by a newer DiskLens: compare with nothing rather than overwrite it.
-                return []
-            }
-            let earlier = all
-                .filter { $0.path == snapshot.path && $0.date < snapshot.date }
-                .sorted { $0.date > $1.date }
-            var bases = Array(earlier.prefix(perRoot))
-            if bases.isEmpty {
-                // A scan of the startup disk keeps "/Users/me" as "/System/Volumes/Data/Users/me".
-                let onDataVolume = PathDisplay.onDataVolume(snapshot.path)
-                bases = Array(all
-                    .filter { $0.date < snapshot.date }
-                    .compactMap { earlier in
-                        earlier.part(at: snapshot.path)
-                            ?? onDataVolume.flatMap { earlier.part(at: $0, shownAs: snapshot.path) }
-                    }
-                    .sorted { $0.date > $1.date }
-                    .prefix(perRoot))
-            }
-
-            all.removeAll { $0.path == snapshot.path && $0.date == snapshot.date }
-            all.append(snapshot)
-            save(pruned(all, keeping: snapshot.path))
-            return bases
+            // Another copy of DiskLens running (`open -n`) may be saving its scan right now too.
+            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let locked = try? FileLock.withLock(folder.appendingPathComponent("snapshots.lock")) { recordLocked(snapshot) }
+            return locked ?? recordLocked(snapshot)
         }
+    }
+
+    private func recordLocked(_ snapshot: FolderSnapshot) -> [FolderSnapshot] {
+        guard var all = load() else {
+            // Written by a newer DiskLens: compare with nothing rather than overwrite it.
+            return []
+        }
+        let earlier = all
+            .filter { $0.path == snapshot.path && $0.date < snapshot.date }
+            .sorted { $0.date > $1.date }
+        var bases = Array(earlier.prefix(perRoot))
+        if bases.isEmpty {
+            // A scan of the startup disk keeps "/Users/me" as "/System/Volumes/Data/Users/me".
+            let onDataVolume = PathDisplay.onDataVolume(snapshot.path)
+            bases = Array(all
+                .filter { $0.date < snapshot.date }
+                .compactMap { earlier in
+                    earlier.part(at: snapshot.path)
+                        ?? onDataVolume.flatMap { earlier.part(at: $0, shownAs: snapshot.path) }
+                }
+                .sorted { $0.date > $1.date }
+                .prefix(perRoot))
+        }
+
+        all.removeAll { $0.path == snapshot.path && $0.date == snapshot.date }
+        all.append(snapshot)
+        save(pruned(all, keeping: snapshot.path))
+        return bases
     }
 
     /// All stored snapshots. Empty when there's no file yet; nil when a newer DiskLens wrote it.
