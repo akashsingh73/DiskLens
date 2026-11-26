@@ -9,3 +9,18 @@ DerivedData/
 
 # macOS Finder metadata
 .DS_Store
+
+# Signing certificates, keys and secrets: they stay in the keychain, never in the repo
+*.p12
+*.pfx
+*.pem
+*.key
+*.cer
+*.crt
+*.certSigningRequest
+*.keychain
+*.keychain-db
+*.mobileprovision
+*.provisionprofile
+.env
+.env.*
